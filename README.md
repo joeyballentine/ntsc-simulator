@@ -10,6 +10,7 @@ A Python tool that simulates the NTSC composite video signal encoding and decodi
 - **Telecine** simulation with 3:2 pulldown (24p film to 480i interlaced)
 - **Image** processing through the NTSC signal path
 - **SMPTE color bars** test pattern generator
+- **Signal degradation effects**: noise (snow), ghosting, attenuation, horizontal jitter
 - **Two comb filter modes**: horizontal 2-sample delay (default) and 1H line-delay
 - Parallel frame processing via multiprocessing
 - Audio passthrough using ffmpeg
@@ -65,6 +66,16 @@ python main.py image photo.png -o ntsc_photo.png
 python main.py colorbars -o colorbars.npy --save-png bars.png
 ```
 
+### Simulate weak signal reception
+
+```bash
+# Subtle snow
+python main.py image photo.png -o noisy.png --noise 0.05
+
+# Heavy degradation — all effects combined
+python main.py roundtrip input.mp4 -o degraded.mp4 --noise 0.08 --ghost 0.3 --attenuation 0.2 --jitter 1.5
+```
+
 ### Options
 
 | Flag | Commands | Description |
@@ -76,6 +87,11 @@ python main.py colorbars -o colorbars.npy --save-png bars.png
 | `--comb-1h` | decode, roundtrip, image | Use 1H line-delay comb filter instead of 2-sample delay |
 | `--crf` | decode, roundtrip | x264 CRF quality, 0=lossless, 51=worst (default: 17) |
 | `--preset` | decode, roundtrip | x264 encoding preset, e.g. `ultrafast`, `fast`, `slow` (default: fast) |
+| `--noise` | decode, roundtrip, image | Snow amplitude (e.g. 0.05=subtle, 0.2=heavy) |
+| `--ghost` | decode, roundtrip, image | Ghost amplitude 0-1 (multipath echo) |
+| `--ghost-delay` | decode, roundtrip, image | Ghost delay in microseconds (default: 2.0) |
+| `--attenuation` | decode, roundtrip, image | Signal attenuation 0-1 (washed-out picture) |
+| `--jitter` | decode, roundtrip, image | Horizontal jitter in samples (timing instability) |
 | `--signal` | image | Also export the composite signal as `.npy` |
 | `--wav` | encode, image, colorbars | Export signal as a WAV file (stretched to 48 kHz for viewing in audio editors) |
 | `--save-png` | colorbars | Save the source SMPTE pattern as PNG |
