@@ -79,14 +79,14 @@ RGB_TO_YIQ = np.array([
     [0.299,     0.587,     0.114    ],   # Y
     [0.595901, -0.274557, -0.321344 ],   # I
     [0.211537, -0.522736,  0.311200 ],   # Q
-], dtype=np.float64)
+], dtype=np.float32)
 
 # YIQ to RGB
 YIQ_TO_RGB = np.array([
     [1.0,  0.956,  0.621],   # R
     [1.0, -0.272, -0.647],   # G
     [1.0, -1.106,  1.703],   # B
-], dtype=np.float64)
+], dtype=np.float32)
 
 # --- Chroma Modulation Angles ---
 # I axis at 123° from burst reference, Q axis at 33°

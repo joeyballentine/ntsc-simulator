@@ -16,7 +16,7 @@ def add_noise(amplitude):
         Transform function: fn(signal, sample_rate) -> signal.
     """
     def transform(signal, sample_rate):
-        noise = np.random.normal(0, amplitude, len(signal))
+        noise = np.random.normal(0, amplitude, len(signal)).astype(signal.dtype)
         return signal + noise
 
     return transform

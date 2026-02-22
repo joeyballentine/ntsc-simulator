@@ -1,12 +1,13 @@
 """FIR low-pass and bandpass filters for NTSC signal processing."""
 
 import numpy as np
-from scipy.signal import firwin, lfilter, filtfilt
+from scipy.signal import firwin, lfilter
+from scipy.fft import rfft, irfft, next_fast_len
 
 from .constants import SAMPLE_RATE
 
 
-def design_lowpass(cutoff_hz, num_taps=61):
+def design_lowpass(cutoff_hz, num_taps=101):
     """Design a FIR low-pass filter.
 
     Args:
@@ -14,13 +15,13 @@ def design_lowpass(cutoff_hz, num_taps=61):
         num_taps: Number of filter taps (odd for symmetric).
 
     Returns:
-        FIR filter coefficients (1D array).
+        FIR filter coefficients (1D array, float32).
     """
     nyquist = SAMPLE_RATE / 2
-    return firwin(num_taps, cutoff_hz / nyquist)
+    return firwin(num_taps, cutoff_hz / nyquist).astype(np.float32)
 
 
-def design_bandpass(low_hz, high_hz, num_taps=61):
+def design_bandpass(low_hz, high_hz, num_taps=101):
     """Design a FIR bandpass filter.
 
     Args:
@@ -29,21 +30,25 @@ def design_bandpass(low_hz, high_hz, num_taps=61):
         num_taps: Number of filter taps (odd for symmetric).
 
     Returns:
-        FIR filter coefficients (1D array).
+        FIR filter coefficients (1D array, float32).
     """
     nyquist = SAMPLE_RATE / 2
-    return firwin(num_taps, [low_hz / nyquist, high_hz / nyquist], pass_zero=False)
+    return firwin(num_taps, [low_hz / nyquist, high_hz / nyquist],
+                  pass_zero=False).astype(np.float32)
 
 
 def apply_filter_zero_phase(coeffs, signal):
-    """Apply a FIR filter with zero phase distortion (non-causal).
+    """Apply a FIR filter with zero phase distortion using FFT.
 
-    Used during encoding where we don't need causal behavior.
+    Uses |H(f)|^2 multiplication in frequency domain, equivalent to
+    scipy.signal.filtfilt but faster for longer filters.
     """
-    if len(signal) <= 3 * len(coeffs):
-        # Signal too short for filtfilt, use lfilter instead
-        return lfilter(coeffs, 1.0, signal)
-    return filtfilt(coeffs, 1.0, signal)
+    n = len(signal)
+    fft_n = next_fast_len(n + len(coeffs) - 1)
+    H = rfft(coeffs, n=fft_n)
+    H2 = (H * np.conj(H)).real
+    X = rfft(signal, n=fft_n)
+    return irfft(X * H2, n=fft_n)[:n]
 
 
 def apply_filter_causal(coeffs, signal):
@@ -58,7 +63,7 @@ def apply_filter_causal(coeffs, signal):
 _filter_cache = {}
 
 
-def get_filter(name, num_taps=61):
+def get_filter(name, num_taps=101):
     """Get a pre-designed filter by name.
 
     Names: 'luma', 'i_channel', 'q_channel', 'chroma_bandpass'
@@ -80,7 +85,7 @@ def get_filter(name, num_taps=61):
     return _filter_cache[key]
 
 
-def lowpass_luma(signal, zero_phase=True, num_taps=201):
+def lowpass_luma(signal, zero_phase=True, num_taps=101):
     """Apply luma low-pass filter (4.2 MHz)."""
     coeffs = get_filter('luma', num_taps)
     if zero_phase:
@@ -88,7 +93,7 @@ def lowpass_luma(signal, zero_phase=True, num_taps=201):
     return apply_filter_causal(coeffs, signal)
 
 
-def lowpass_i(signal, zero_phase=True, num_taps=201):
+def lowpass_i(signal, zero_phase=True, num_taps=101):
     """Apply I channel low-pass filter (1.5 MHz)."""
     coeffs = get_filter('i_channel', num_taps)
     if zero_phase:
@@ -96,7 +101,7 @@ def lowpass_i(signal, zero_phase=True, num_taps=201):
     return apply_filter_causal(coeffs, signal)
 
 
-def lowpass_q(signal, zero_phase=True, num_taps=201):
+def lowpass_q(signal, zero_phase=True, num_taps=101):
     """Apply Q channel low-pass filter (0.5 MHz)."""
     coeffs = get_filter('q_channel', num_taps)
     if zero_phase:
@@ -104,7 +109,7 @@ def lowpass_q(signal, zero_phase=True, num_taps=201):
     return apply_filter_causal(coeffs, signal)
 
 
-def bandpass_chroma(signal, zero_phase=False, num_taps=201):
+def bandpass_chroma(signal, zero_phase=False, num_taps=101):
     """Apply chroma bandpass filter (~2-4.2 MHz)."""
     coeffs = get_filter('chroma_bandpass', num_taps)
     if zero_phase:
