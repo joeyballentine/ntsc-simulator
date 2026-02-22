@@ -8,6 +8,7 @@ import subprocess
 import sys
 
 import numpy as np
+from tqdm import tqdm
 
 
 class FFmpegWriter:
@@ -84,6 +85,44 @@ def _make_writer(filepath, width, height, fps=29.97, interlaced=False):
     return CV2Writer(filepath, width, height, fps)
 
 
+def _mux_audio(source_path, video_path):
+    """Copy audio from source into the output video file using ffmpeg.
+
+    Replaces video_path in-place if audio is found.
+    """
+    if not shutil.which('ffmpeg'):
+        return
+
+    # Check if source has audio
+    probe = subprocess.run(
+        ['ffprobe', '-v', 'error', '-select_streams', 'a',
+         '-show_entries', 'stream=codec_type', '-of', 'csv=p=0',
+         source_path],
+        capture_output=True, text=True,
+    )
+    if 'audio' not in probe.stdout:
+        return
+
+    # Mux: copy video from our output + copy audio from source
+    tmp = video_path + '.mux.mp4'
+    result = subprocess.run(
+        ['ffmpeg', '-y',
+         '-i', video_path,
+         '-i', source_path,
+         '-map', '0:v', '-map', '1:a',
+         '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k',
+         '-shortest',
+         tmp],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    if result.returncode == 0:
+        os.replace(tmp, video_path)
+    else:
+        # Clean up temp file on failure
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
 def _read_input(path):
     """Open a video file with OpenCV, return (capture, frame_count)."""
     import cv2
@@ -115,14 +154,12 @@ def cmd_encode(args):
     all_signals = []
     frame_num = 0
 
-    while True:
+    for _ in tqdm(range(total_frames), unit='frame', desc='Encoding'):
         frame_rgb = _read_frame_rgb(cap)
         if frame_rgb is None:
             break
         all_signals.append(encode_frame(frame_rgb, frame_number=frame_num))
         frame_num += 1
-        if frame_num % 10 == 0:
-            print(f"  Encoded frame {frame_num}/{total_frames}")
 
     cap.release()
 
@@ -155,15 +192,13 @@ def cmd_decode(args):
     height = args.height
     out = _make_writer(args.output, width, height)
 
-    for i in range(num_frames):
+    comb_1h = getattr(args, 'comb_1h', False)
+    for i in tqdm(range(num_frames), unit='frame', desc='Decoding'):
         frame_signal = signal[i * samples_per_frame:(i + 1) * samples_per_frame]
-        comb_1h = getattr(args, 'comb_1h', False)
         frame_rgb = decode_frame(frame_signal, frame_number=i,
                                  output_width=width, output_height=height,
                                  comb_1h=comb_1h)
         out.write(frame_rgb)
-        if (i + 1) % 10 == 0:
-            print(f"  Decoded frame {i + 1}/{num_frames}")
 
     out.release()
     print(f"Done: {args.output}")
@@ -213,12 +248,16 @@ def cmd_roundtrip(args):
     cap.release()
     out.release()
 
+    # Mux audio from source into output
+    _mux_audio(args.input, args.output)
+
 
 def _roundtrip_progressive(cap, out, width, height, total_frames, workers,
                            comb_1h=False):
     """Progressive roundtrip with parallel processing."""
     frame_num = 0
     batch_size = workers * 2
+    pbar = tqdm(total=total_frames, unit='frame', desc='Processing')
 
     with multiprocessing.Pool(workers) as pool:
         while True:
@@ -241,9 +280,9 @@ def _roundtrip_progressive(cap, out, width, height, total_frames, workers,
                 out.write(result)
                 frame_num += 1
 
-            if frame_num % 25 == 0 or len(batch) < batch_size:
-                print(f"  Frame {frame_num}/{total_frames}")
+            pbar.update(len(results))
 
+    pbar.close()
     print(f"Done: {frame_num} output frames")
 
 
@@ -262,6 +301,7 @@ def _roundtrip_telecine(cap, out, width, height, total_frames, workers,
     film_idx = 0
     # Process multiple groups at once: read N groups, expand to NTSC jobs, process in parallel
     groups_per_batch = max(1, workers)  # N groups -> 5N NTSC frames per batch
+    pbar = tqdm(total=total_frames, unit='film frame', desc='Processing')
 
     with multiprocessing.Pool(workers) as pool:
         while True:
@@ -304,10 +344,9 @@ def _roundtrip_telecine(cap, out, width, height, total_frames, workers,
 
             film_idx += len(film_buf)
             ntsc_num += len(results)
+            pbar.update(len(film_buf))
 
-            if ntsc_num % 25 == 0 or len(film_buf) < groups_per_batch * 4:
-                print(f"  NTSC frame {ntsc_num} (film frame {film_idx}/{total_frames})")
-
+    pbar.close()
     print(f"Done: {film_idx} film frames -> {ntsc_num} NTSC frames")
 
 
