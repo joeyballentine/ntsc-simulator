@@ -1,6 +1,7 @@
 """NTSC composite video encoder: RGB frames -> 1D composite signal."""
 
 import numpy as np
+from scipy.signal import filtfilt, firwin
 
 from .constants import (
     FSC, SAMPLE_RATE, SAMPLES_PER_LINE, TOTAL_LINES, VISIBLE_LINES,
@@ -10,211 +11,183 @@ from .constants import (
     COMPOSITE_SCALE, COMPOSITE_OFFSET,
     RGB_TO_YIQ, I_PHASE_RAD, Q_PHASE_RAD, GAMMA,
     EQ_PULSE_SAMPLES, VSYNC_PULSE_SAMPLES, HALF_LINE_SAMPLES,
-    BURST_AMPLITUDE_IRE,
+    BURST_AMPLITUDE_IRE, LUMA_BW, I_BW, Q_BW,
 )
-from .filters import lowpass_luma, lowpass_i, lowpass_q
 
-# Precompute the angular frequency ratio (fsc is exactly 1/4 of sample rate)
-_OMEGA_PER_SAMPLE = 2.0 * np.pi * FSC / SAMPLE_RATE  # = π/2
+_OMEGA_PER_SAMPLE = 2.0 * np.pi * FSC / SAMPLE_RATE  # π/2
+
+# Precompute filter coefficients
+_NYQ = SAMPLE_RATE / 2
+_NUM_TAPS = 201
+_FIR_Y = firwin(_NUM_TAPS, LUMA_BW / _NYQ)
+_FIR_I = firwin(_NUM_TAPS, I_BW / _NYQ)
+_FIR_Q = firwin(_NUM_TAPS, Q_BW / _NYQ)
+
+# Precompute active region sample indices (absolute position within a line)
+_ACTIVE_START = (FRONT_PORCH_SAMPLES + HSYNC_SAMPLES +
+                 BREEZEWAY_SAMPLES + BURST_SAMPLES + BACK_PORCH_SAMPLES)
+_ACTIVE_INDICES = np.arange(ACTIVE_SAMPLES, dtype=np.float64) + _ACTIVE_START
+
+# Precompute burst sample indices
+_BURST_START = FRONT_PORCH_SAMPLES + HSYNC_SAMPLES + BREEZEWAY_SAMPLES
+_BURST_INDICES = np.arange(BURST_SAMPLES, dtype=np.float64) + _BURST_START
 
 
 def rgb_to_yiq(frame):
-    """Convert an RGB frame (H x W x 3, uint8) to YIQ (float64, [0-1] luma).
-
-    Applies gamma correction (linearization) before matrix multiply.
-    """
+    """Convert an RGB frame (H x W x 3, uint8) to YIQ (float64)."""
     rgb = frame.astype(np.float64) / 255.0
     rgb = np.power(rgb, GAMMA)
-    yiq = rgb @ RGB_TO_YIQ.T
-    return yiq
+    return rgb @ RGB_TO_YIQ.T
 
 
-def _resample_line(line_data, target_samples):
-    """Resample a 1D array to target number of samples."""
-    if len(line_data) == target_samples:
-        return line_data
-    x_old = np.linspace(0, 1, len(line_data))
-    x_new = np.linspace(0, 1, target_samples)
-    return np.interp(x_new, x_old, line_data)
+def _resample_rows(data_2d, target_width):
+    """Resample all rows of a 2D array to target_width using linear interpolation."""
+    num_rows, src_width = data_2d.shape
+    if src_width == target_width:
+        return data_2d
+    x_old = np.linspace(0, 1, src_width)
+    x_new = np.linspace(0, 1, target_width)
+    # Vectorized: interpolate each row
+    out = np.empty((num_rows, target_width), dtype=np.float64)
+    for i in range(num_rows):
+        out[i] = np.interp(x_new, x_old, data_2d[i])
+    return out
 
 
-def _carrier(sample_indices, phase_offset, line_start_phase):
-    """Generate cosine carrier at given absolute sample positions within a line."""
-    phase = _OMEGA_PER_SAMPLE * sample_indices + line_start_phase + phase_offset
-    return np.cos(phase)
+def _filtfilt_2d(coeffs, data_2d):
+    """Apply zero-phase FIR filter to each row of a 2D array."""
+    if data_2d.shape[1] <= 3 * len(coeffs):
+        from scipy.signal import lfilter
+        return lfilter(coeffs, 1.0, data_2d, axis=1)
+    return filtfilt(coeffs, 1.0, data_2d, axis=1)
+
+
+def _build_visible_line_map(src_height):
+    """Build mapping from visible line index (0-479) to source row index.
+
+    Returns array of shape (480,) with source row indices.
+    """
+    visible = np.arange(VISIBLE_LINES)
+    if src_height == VISIBLE_LINES:
+        return visible
+    return np.minimum((visible * src_height // VISIBLE_LINES), src_height - 1)
+
+
+def _build_line_to_visible():
+    """Build array mapping absolute line number -> visible line index (-1 if not visible)."""
+    mapping = np.full(TOTAL_LINES, -1, dtype=np.int32)
+    # Field 1: lines 20-259 -> visible 0, 2, 4, ...
+    for ln in range(20, 260):
+        mapping[ln] = (ln - 20) * 2
+    # Field 2: lines 283-522 -> visible 1, 3, 5, ...
+    for ln in range(283, 523):
+        mapping[ln] = (ln - 283) * 2 + 1
+    return mapping
+
+
+_LINE_TO_VISIBLE = _build_line_to_visible()
 
 
 def encode_frame(frame, frame_number=0):
-    """Encode a single RGB frame to a composite NTSC signal.
-
-    Args:
-        frame: RGB image as numpy array (H x W x 3, uint8).
-        frame_number: Frame index (affects interlace field order).
-
-    Returns:
-        1D numpy array of composite signal voltage values (0-1 range).
-    """
+    """Encode a single RGB frame to a composite NTSC signal (vectorized)."""
     h, w, _ = frame.shape
-    yiq = rgb_to_yiq(frame)
+    yiq = rgb_to_yiq(frame)  # (H, W, 3)
 
-    signal = np.full(TOTAL_LINES * SAMPLES_PER_LINE, BLANKING_V, dtype=np.float64)
+    # Map all 480 visible lines to source rows, extract and resample
+    src_rows = _build_visible_line_map(h)
+    y_all = _resample_rows(yiq[src_rows, :, 0], ACTIVE_SAMPLES)  # (480, 754)
+    i_all = _resample_rows(yiq[src_rows, :, 1], ACTIVE_SAMPLES)
+    q_all = _resample_rows(yiq[src_rows, :, 2], ACTIVE_SAMPLES)
 
-    # Precompute the sample offset where active video begins
-    active_start = (FRONT_PORCH_SAMPLES + HSYNC_SAMPLES +
-                    BREEZEWAY_SAMPLES + BURST_SAMPLES + BACK_PORCH_SAMPLES)
+    # Bandwidth-limit all rows at once
+    y_all = _filtfilt_2d(_FIR_Y, y_all)
+    i_all = _filtfilt_2d(_FIR_I, i_all)
+    q_all = _filtfilt_2d(_FIR_Q, q_all)
 
-    for line_num in range(TOTAL_LINES):
-        line_offset = line_num * SAMPLES_PER_LINE
-        line_signal = signal[line_offset:line_offset + SAMPLES_PER_LINE]
+    # Build carrier phases for all 480 visible lines.
+    # visible_line -> absolute_line_num is needed for the phase.
+    # Field 1: visible 0,2,4...478 -> line 20,21,...259
+    # Field 2: visible 1,3,5...479 -> line 283,284,...522
+    abs_lines = np.empty(VISIBLE_LINES, dtype=np.int32)
+    abs_lines[0::2] = np.arange(20, 260)   # field 1
+    abs_lines[1::2] = np.arange(283, 523)  # field 2
 
-        # Phase of subcarrier at sample 0 of this line.
-        # 910 samples/line at 4xfsc = 227.5 cycles, so phase advances π each line.
-        line_start_phase = np.pi * line_num
+    # line_start_phase for each visible line
+    line_phases = (np.pi * abs_lines).reshape(-1, 1)  # (480, 1)
 
-        if _is_vblank_line(line_num):
-            _encode_vblank_line(line_signal, line_num, line_start_phase)
-            continue
+    # Carrier for active region: phase = omega * index + line_phase + angle
+    active_phase = _OMEGA_PER_SAMPLE * _ACTIVE_INDICES.reshape(1, -1) + line_phases
+    i_carrier = np.cos(active_phase + I_PHASE_RAD)  # (480, 754)
+    q_carrier = np.cos(active_phase + Q_PHASE_RAD)
 
-        visible_line = _line_to_visible(line_num)
-        if visible_line is None or visible_line >= h:
-            _encode_blank_line(line_signal, line_start_phase)
-            continue
+    # Modulate and composite
+    chroma = i_all * i_carrier + q_all * q_carrier
+    active_voltage = (y_all + chroma) * COMPOSITE_SCALE + COMPOSITE_OFFSET  # (480, 754)
 
-        # Map visible line to source row
-        src_row = int(visible_line * h / VISIBLE_LINES) if h != VISIBLE_LINES else visible_line
-        src_row = min(src_row, h - 1)
+    # --- Build the full 525-line signal ---
+    signal = np.full((TOTAL_LINES, SAMPLES_PER_LINE), BLANKING_V, dtype=np.float64)
 
-        y_line = _resample_line(yiq[src_row, :, 0], ACTIVE_SAMPLES)
-        i_line = _resample_line(yiq[src_row, :, 1], ACTIVE_SAMPLES)
-        q_line = _resample_line(yiq[src_row, :, 2], ACTIVE_SAMPLES)
+    # Write blanking structure for all lines
+    _write_blanking_structure(signal)
 
-        # Bandwidth limit Y, I, Q
-        y_line = lowpass_luma(y_line)
-        i_line = lowpass_i(i_line)
-        q_line = lowpass_q(q_line)
+    # Write colorburst for all non-vblank lines
+    _write_burst_all(signal, abs_lines, line_phases.ravel())
 
-        # Absolute sample indices for the active region within the line
-        active_indices = np.arange(ACTIVE_SAMPLES, dtype=np.float64) + active_start
+    # Write active video into the correct lines
+    for vis_idx in range(VISIBLE_LINES):
+        ln = abs_lines[vis_idx]
+        signal[ln, _ACTIVE_START:_ACTIVE_START + ACTIVE_SAMPLES] = active_voltage[vis_idx]
 
-        # Modulate chroma onto carrier using absolute positions
-        i_carrier = _carrier(active_indices, I_PHASE_RAD, line_start_phase)
-        q_carrier = _carrier(active_indices, Q_PHASE_RAD, line_start_phase)
-        chroma = i_line * i_carrier + q_line * q_carrier
+    # Write burst on blank (non-vblank, non-visible) lines too
+    _write_burst_blank_lines(signal)
 
-        # Composite = luma + chroma, scaled to voltage
-        composite = y_line + chroma
-        active_voltage = composite * COMPOSITE_SCALE + COMPOSITE_OFFSET
-
-        # Build the full line with blanking, sync, burst, active
-        _encode_active_line(line_signal, active_voltage, line_start_phase)
-
-    return signal
+    return signal.ravel()
 
 
-def _is_vblank_line(line_num):
-    """Check if a line number is in the vertical blanking interval."""
-    if line_num < 20:
-        return True
-    if 262 <= line_num < 283:
-        return True
-    return False
+def _write_blanking_structure(signal):
+    """Write sync pulses and blanking for all 525 lines (vectorized)."""
+    fp = FRONT_PORCH_SAMPLES
+    hs = HSYNC_SAMPLES
+
+    # Normal hsync for all lines first
+    signal[:, fp:fp + hs] = SYNC_TIP_V
+
+    # Overwrite vblank lines with special sync patterns
+    # Pre-eq pulses: lines 0-2, 262-264
+    for ln in list(range(0, 3)) + list(range(262, 265)):
+        signal[ln, :] = BLANKING_V
+        signal[ln, 0:EQ_PULSE_SAMPLES] = SYNC_TIP_V
+        signal[ln, HALF_LINE_SAMPLES:HALF_LINE_SAMPLES + EQ_PULSE_SAMPLES] = SYNC_TIP_V
+
+    # Vsync broad pulses: lines 3-5, 265-267
+    for ln in list(range(3, 6)) + list(range(265, 268)):
+        signal[ln, :] = BLANKING_V
+        signal[ln, 0:VSYNC_PULSE_SAMPLES] = SYNC_TIP_V
+        signal[ln, HALF_LINE_SAMPLES:HALF_LINE_SAMPLES + VSYNC_PULSE_SAMPLES] = SYNC_TIP_V
+
+    # Post-eq pulses: lines 6-8, 268-270
+    for ln in list(range(6, 9)) + list(range(268, 271)):
+        signal[ln, :] = BLANKING_V
+        signal[ln, 0:EQ_PULSE_SAMPLES] = SYNC_TIP_V
+        signal[ln, HALF_LINE_SAMPLES:HALF_LINE_SAMPLES + EQ_PULSE_SAMPLES] = SYNC_TIP_V
 
 
-def _line_to_visible(line_num):
-    """Map an absolute line number to a visible line index (0-479)."""
-    if line_num < 20:
-        return None
-    if line_num < 263:
-        field_line = line_num - 20
-        if field_line >= 240:
-            return None
-        return field_line * 2
-    if line_num < 283:
-        return None
-    field_line = line_num - 283
-    if field_line >= 240:
-        return None
-    return field_line * 2 + 1
-
-
-def _encode_active_line(line_signal, active_voltage, line_start_phase):
-    """Write a complete active video line with sync, burst, and picture."""
-    pos = 0
-
-    # Front porch
-    line_signal[pos:pos + FRONT_PORCH_SAMPLES] = BLANKING_V
-    pos += FRONT_PORCH_SAMPLES
-
-    # Horizontal sync
-    line_signal[pos:pos + HSYNC_SAMPLES] = SYNC_TIP_V
-    pos += HSYNC_SAMPLES
-
-    # Breezeway
-    line_signal[pos:pos + BREEZEWAY_SAMPLES] = BLANKING_V
-    pos += BREEZEWAY_SAMPLES
-
-    # Colorburst — use absolute sample positions for phase consistency
-    burst_indices = np.arange(BURST_SAMPLES, dtype=np.float64) + pos
-    burst_phase = _OMEGA_PER_SAMPLE * burst_indices + line_start_phase
+def _write_burst_all(signal, abs_lines, line_phases):
+    """Write colorburst on all visible lines."""
     burst_v = BURST_AMPLITUDE_IRE / 140.0
-    line_signal[pos:pos + BURST_SAMPLES] = BLANKING_V + (-np.cos(burst_phase) * burst_v)
-    pos += BURST_SAMPLES
-
-    # Back porch
-    line_signal[pos:pos + BACK_PORCH_SAMPLES] = BLANKING_V
-    pos += BACK_PORCH_SAMPLES
-
-    # Active video — already ACTIVE_SAMPLES wide, which equals SAMPLES_PER_LINE - pos
-    line_signal[pos:pos + len(active_voltage)] = active_voltage
+    for idx in range(len(abs_lines)):
+        ln = abs_lines[idx]
+        phase = _OMEGA_PER_SAMPLE * _BURST_INDICES + line_phases[idx]
+        signal[ln, _BURST_START:_BURST_START + BURST_SAMPLES] = BLANKING_V + (-np.cos(phase) * burst_v)
 
 
-def _encode_blank_line(line_signal, line_start_phase):
-    """Write a blank line (sync + burst + blanking level)."""
-    line_signal[:] = BLANKING_V
-
-    pos = 0
-    line_signal[pos:pos + FRONT_PORCH_SAMPLES] = BLANKING_V
-    pos += FRONT_PORCH_SAMPLES
-    line_signal[pos:pos + HSYNC_SAMPLES] = SYNC_TIP_V
-    pos += HSYNC_SAMPLES
-    line_signal[pos:pos + BREEZEWAY_SAMPLES] = BLANKING_V
-    pos += BREEZEWAY_SAMPLES
-
-    burst_indices = np.arange(BURST_SAMPLES, dtype=np.float64) + pos
-    burst_phase = _OMEGA_PER_SAMPLE * burst_indices + line_start_phase
+def _write_burst_blank_lines(signal):
+    """Write colorburst on blank (non-visible, non-vblank special) lines."""
     burst_v = BURST_AMPLITUDE_IRE / 140.0
-    line_signal[pos:pos + BURST_SAMPLES] = BLANKING_V + (-np.cos(burst_phase) * burst_v)
-
-
-def _encode_vblank_line(line_signal, line_num, line_start_phase):
-    """Encode vertical blanking lines including vsync and equalizing pulses."""
-    if line_num < 3:
-        _write_eq_pulses(line_signal)
-    elif line_num < 6:
-        _write_vsync_pulses(line_signal)
-    elif line_num < 9:
-        _write_eq_pulses(line_signal)
-    elif line_num < 20:
-        _encode_blank_line(line_signal, line_start_phase)
-    elif 262 <= line_num < 265:
-        _write_eq_pulses(line_signal)
-    elif 265 <= line_num < 268:
-        _write_vsync_pulses(line_signal)
-    elif 268 <= line_num < 271:
-        _write_eq_pulses(line_signal)
-    else:
-        _encode_blank_line(line_signal, line_start_phase)
-
-
-def _write_eq_pulses(line_signal):
-    """Write two equalizing pulses per line (half-line rate)."""
-    line_signal[:] = BLANKING_V
-    line_signal[0:EQ_PULSE_SAMPLES] = SYNC_TIP_V
-    line_signal[HALF_LINE_SAMPLES:HALF_LINE_SAMPLES + EQ_PULSE_SAMPLES] = SYNC_TIP_V
-
-
-def _write_vsync_pulses(line_signal):
-    """Write two broad (vertical sync) pulses per line."""
-    line_signal[:] = BLANKING_V
-    line_signal[0:VSYNC_PULSE_SAMPLES] = SYNC_TIP_V
-    line_signal[HALF_LINE_SAMPLES:HALF_LINE_SAMPLES + VSYNC_PULSE_SAMPLES] = SYNC_TIP_V
+    # Lines 9-19 and 271-282 are normal blank lines that need burst
+    blank_lines = list(range(9, 20)) + list(range(260, 262)) + list(range(271, 283)) + list(range(523, 525))
+    for ln in blank_lines:
+        if ln >= TOTAL_LINES:
+            continue
+        phase = _OMEGA_PER_SAMPLE * _BURST_INDICES + np.pi * ln
+        signal[ln, _BURST_START:_BURST_START + BURST_SAMPLES] = BLANKING_V + (-np.cos(phase) * burst_v)
