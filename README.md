@@ -2,6 +2,13 @@
 
 A Python tool that simulates the NTSC composite video signal encoding and decoding pipeline. Process video or images through an accurate analog signal path to reproduce the characteristic artifacts of NTSC television — color bleeding, rainbow cross-color, dot crawl, and chroma/luma bandwidth limitations.
 
+## Examples
+
+| Source | NTSC Roundtrip | Degraded Signal |
+|:---:|:---:|:---:|
+| ![Source](examples/colorbars_source.png) | ![NTSC](examples/colorbars_ntsc.png) | ![Degraded](examples/colorbars_degraded.png) |
+| Clean SMPTE color bars | After encode/decode roundtrip | `--noise 0.05 --ghost 0.15 --attenuation 0.1 --jitter 0.5` |
+
 ## Features
 
 - **Roundtrip** video through the full encode/decode pipeline in memory
@@ -13,7 +20,6 @@ A Python tool that simulates the NTSC composite video signal encoding and decodi
 - **Signal degradation effects**: noise (snow), ghosting, attenuation, horizontal jitter
 - **Two comb filter modes**: horizontal 2-sample delay (default) and 1H line-delay
 - Parallel frame processing via multiprocessing
-- Audio passthrough using ffmpeg
 
 ## Requirements
 
@@ -129,4 +135,4 @@ Run `python main.py <command> -h` for full details on any subcommand.
 ## Comb Filter Modes
 
 - **2-sample delay** (default): Cancels chroma from luma using a horizontal delay. Can produce rainbow cross-color on sharp edges.
-- **1H line-delay** (`--comb-1h`): Uses the adjacent line from the same field. Reduces rainbow artifacts but introduces hanging-dot patterns on horizontal color transitions.
+- **1H line-delay** (`--comb-1h`): Uses the adjacent line from the same field. Reduces rainbow artifacts but introduces hanging-dot patterns on horizontal color transitions as well as some line doubling.

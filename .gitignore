@@ -11,3 +11,7 @@ build/
 *.avi
 .venv/
 venv/
+
+# Allow example images
+!examples/
+!examples/*.png
