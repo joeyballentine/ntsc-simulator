@@ -217,6 +217,8 @@ def _roundtrip_telecine(cap, out, pipeline, encode_frame, decode_frame,
                         width, height, total_frames):
     """3:2 pulldown telecine: 4 input frames -> 5 NTSC frames (480i).
 
+    Streams frames in groups of 4 to avoid loading entire video into memory.
+
     Pulldown pattern per group of 4 film frames A, B, C, D:
       NTSC frame 1: field1=A, field2=A  (clean)
       NTSC frame 2: field1=B, field2=B  (clean)
@@ -224,57 +226,46 @@ def _roundtrip_telecine(cap, out, pipeline, encode_frame, decode_frame,
       NTSC frame 4: field1=C, field2=D  (combed)
       NTSC frame 5: field1=D, field2=D  (clean)
     """
-    film_frames = []
-    while True:
-        frame_rgb = _read_frame_rgb(cap)
-        if frame_rgb is None:
-            break
-        film_frames.append(frame_rgb)
-
-    total_film = len(film_frames)
-    ntsc_num = 0
-    film_idx = 0
-
-    while film_idx + 3 < total_film:
-        a = film_frames[film_idx]
-        b = film_frames[film_idx + 1]
-        c = film_frames[film_idx + 2]
-        d = film_frames[film_idx + 3]
-
-        field_pairs = [
-            (a, a),  # clean
-            (b, b),  # clean
-            (b, c),  # combed
-            (c, d),  # combed
-            (d, d),  # clean
-        ]
-
-        for f1_frame, f2_frame in field_pairs:
-            signal = encode_frame(f1_frame, frame_number=ntsc_num,
-                                  field2_frame=f2_frame)
-            if len(pipeline) > 0:
-                signal = pipeline.process(signal)
-            result = decode_frame(signal, frame_number=ntsc_num,
-                                  output_width=width, output_height=height)
-            out.write(result)
-            ntsc_num += 1
-
-        film_idx += 4
-        if ntsc_num % 10 == 0:
-            print(f"  NTSC frame {ntsc_num} (film frame {film_idx}/{total_film})")
-
-    # Handle remaining frames (< 4) as progressive
-    while film_idx < total_film:
-        signal = encode_frame(film_frames[film_idx], frame_number=ntsc_num)
+    def _encode_decode(f1, f2, ntsc_num):
+        signal = encode_frame(f1, frame_number=ntsc_num, field2_frame=f2)
         if len(pipeline) > 0:
             signal = pipeline.process(signal)
-        result = decode_frame(signal, frame_number=ntsc_num,
-                              output_width=width, output_height=height)
-        out.write(result)
-        ntsc_num += 1
-        film_idx += 1
+        return decode_frame(signal, frame_number=ntsc_num,
+                            output_width=width, output_height=height)
 
-    print(f"Done: {total_film} film frames -> {ntsc_num} NTSC frames")
+    ntsc_num = 0
+    film_idx = 0
+    buf = []  # Rolling buffer of up to 4 frames
+
+    while True:
+        # Fill buffer to 4 frames
+        while len(buf) < 4:
+            frame_rgb = _read_frame_rgb(cap)
+            if frame_rgb is None:
+                break
+            buf.append(frame_rgb)
+
+        if len(buf) >= 4:
+            a, b, c, d = buf[0], buf[1], buf[2], buf[3]
+
+            for f1, f2 in [(a, a), (b, b), (b, c), (c, d), (d, d)]:
+                out.write(_encode_decode(f1, f2, ntsc_num))
+                ntsc_num += 1
+
+            film_idx += 4
+            buf = buf[4:]  # Advance past the group
+
+            if ntsc_num % 25 == 0:
+                print(f"  NTSC frame {ntsc_num} (film frame {film_idx}/{total_frames})")
+        else:
+            # Fewer than 4 remaining — output as progressive
+            for frame in buf:
+                out.write(_encode_decode(frame, frame, ntsc_num))
+                ntsc_num += 1
+                film_idx += 1
+            break
+
+    print(f"Done: {film_idx} film frames -> {ntsc_num} NTSC frames")
 
 
 def cmd_image(args):
