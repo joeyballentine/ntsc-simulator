@@ -88,16 +88,43 @@ def _build_line_to_visible():
 _LINE_TO_VISIBLE = _build_line_to_visible()
 
 
-def encode_frame(frame, frame_number=0):
-    """Encode a single RGB frame to a composite NTSC signal (vectorized)."""
-    h, w, _ = frame.shape
-    yiq = rgb_to_yiq(frame)  # (H, W, 3)
+def encode_frame(frame, frame_number=0, field2_frame=None):
+    """Encode a single RGB frame to a composite NTSC signal (vectorized).
 
-    # Map all 480 visible lines to source rows, extract and resample
-    src_rows = _build_visible_line_map(h)
-    y_all = _resample_rows(yiq[src_rows, :, 0], ACTIVE_SAMPLES)  # (480, 754)
-    i_all = _resample_rows(yiq[src_rows, :, 1], ACTIVE_SAMPLES)
-    q_all = _resample_rows(yiq[src_rows, :, 2], ACTIVE_SAMPLES)
+    Args:
+        frame: RGB image for field 1 (and field 2 if field2_frame is None).
+        frame_number: Frame index.
+        field2_frame: Optional separate RGB image for field 2 (telecine/interlace).
+    """
+    h, w, _ = frame.shape
+    yiq1 = rgb_to_yiq(frame)  # (H, W, 3)
+
+    if field2_frame is not None:
+        yiq2 = rgb_to_yiq(field2_frame)
+    else:
+        yiq2 = yiq1
+
+    # Field 1 = even visible lines (0,2,4...478) -> 240 lines from yiq1
+    # Field 2 = odd visible lines (1,3,5...479) -> 240 lines from yiq2
+    src_rows_f1 = _build_visible_line_map(h)[0::2]  # 240 rows for field 1
+    src_rows_f2 = _build_visible_line_map(yiq2.shape[0])[1::2]  # 240 rows for field 2
+
+    # Resample each field's rows to active width
+    y_f1 = _resample_rows(yiq1[src_rows_f1, :, 0], ACTIVE_SAMPLES)
+    i_f1 = _resample_rows(yiq1[src_rows_f1, :, 1], ACTIVE_SAMPLES)
+    q_f1 = _resample_rows(yiq1[src_rows_f1, :, 2], ACTIVE_SAMPLES)
+
+    y_f2 = _resample_rows(yiq2[src_rows_f2, :, 0], ACTIVE_SAMPLES)
+    i_f2 = _resample_rows(yiq2[src_rows_f2, :, 1], ACTIVE_SAMPLES)
+    q_f2 = _resample_rows(yiq2[src_rows_f2, :, 2], ACTIVE_SAMPLES)
+
+    # Interleave fields: visible line 0 from f1, 1 from f2, 2 from f1, ...
+    y_all = np.empty((VISIBLE_LINES, ACTIVE_SAMPLES), dtype=np.float64)
+    i_all = np.empty_like(y_all)
+    q_all = np.empty_like(y_all)
+    y_all[0::2] = y_f1;  y_all[1::2] = y_f2
+    i_all[0::2] = i_f1;  i_all[1::2] = i_f2
+    q_all[0::2] = q_f1;  q_all[1::2] = q_f2
 
     # Bandwidth-limit all rows at once
     y_all = _filtfilt_2d(_FIR_Y, y_all)
