@@ -157,8 +157,10 @@ def cmd_decode(args):
 
     for i in range(num_frames):
         frame_signal = signal[i * samples_per_frame:(i + 1) * samples_per_frame]
+        comb_1h = getattr(args, 'comb_1h', False)
         frame_rgb = decode_frame(frame_signal, frame_number=i,
-                                 output_width=width, output_height=height)
+                                 output_width=width, output_height=height,
+                                 comb_1h=comb_1h)
         out.write(frame_rgb)
         if (i + 1) % 10 == 0:
             print(f"  Decoded frame {i + 1}/{num_frames}")
@@ -175,11 +177,12 @@ def _ntsc_worker(args):
     from ntsc_simulator.encoder import encode_frame
     from ntsc_simulator.decoder import decode_frame
 
-    frame_rgb, frame_number, width, height, field2_frame = args
+    frame_rgb, frame_number, width, height, field2_frame, comb_1h = args
     signal = encode_frame(frame_rgb, frame_number=frame_number,
                           field2_frame=field2_frame)
     return decode_frame(signal, frame_number=frame_number,
-                        output_width=width, output_height=height)
+                        output_width=width, output_height=height,
+                        comb_1h=comb_1h)
 
 
 def _get_num_workers():
@@ -194,22 +197,25 @@ def cmd_roundtrip(args):
     height = args.height
     workers = _get_num_workers()
 
+    comb_1h = getattr(args, 'comb_1h', False)
+
     if args.telecine:
         out = _make_writer(args.output, width, height, fps=29.97, interlaced=True)
         print(f"Roundtrip (3:2 telecine 480i): {args.input} -> composite -> {args.output}")
         print(f"  Output: {width}x{height} 29.97fps interlaced (TFF), {workers} workers")
-        _roundtrip_telecine(cap, out, width, height, total_frames, workers)
+        _roundtrip_telecine(cap, out, width, height, total_frames, workers, comb_1h)
     else:
         out = _make_writer(args.output, width, height, fps=29.97, interlaced=False)
         print(f"Roundtrip (progressive): {args.input} -> composite -> {args.output}")
         print(f"  Output: {width}x{height} 29.97fps progressive, {workers} workers")
-        _roundtrip_progressive(cap, out, width, height, total_frames, workers)
+        _roundtrip_progressive(cap, out, width, height, total_frames, workers, comb_1h)
 
     cap.release()
     out.release()
 
 
-def _roundtrip_progressive(cap, out, width, height, total_frames, workers):
+def _roundtrip_progressive(cap, out, width, height, total_frames, workers,
+                           comb_1h=False):
     """Progressive roundtrip with parallel processing."""
     frame_num = 0
     batch_size = workers * 2
@@ -222,7 +228,8 @@ def _roundtrip_progressive(cap, out, width, height, total_frames, workers):
                 frame_rgb = _read_frame_rgb(cap)
                 if frame_rgb is None:
                     break
-                batch.append((frame_rgb, frame_num + len(batch), width, height, None))
+                batch.append((frame_rgb, frame_num + len(batch), width, height,
+                              None, comb_1h))
 
             if not batch:
                 break
@@ -240,7 +247,8 @@ def _roundtrip_progressive(cap, out, width, height, total_frames, workers):
     print(f"Done: {frame_num} output frames")
 
 
-def _roundtrip_telecine(cap, out, width, height, total_frames, workers):
+def _roundtrip_telecine(cap, out, width, height, total_frames, workers,
+                        comb_1h=False):
     """3:2 pulldown telecine with parallel processing.
 
     Pulldown pattern per group of 4 film frames A, B, C, D:
@@ -274,13 +282,15 @@ def _roundtrip_telecine(cap, out, width, height, total_frames, workers):
             while fi + 3 < len(film_buf):
                 a, b, c, d = film_buf[fi], film_buf[fi+1], film_buf[fi+2], film_buf[fi+3]
                 for f1, f2 in [(a, a), (b, b), (b, c), (c, d), (d, d)]:
-                    jobs.append((f1, ntsc_num + len(jobs), width, height, f2))
+                    jobs.append((f1, ntsc_num + len(jobs), width, height, f2,
+                                 comb_1h))
                 fi += 4
 
             # Handle remaining < 4 frames as progressive
             while fi < len(film_buf):
                 f = film_buf[fi]
-                jobs.append((f, ntsc_num + len(jobs), width, height, None))
+                jobs.append((f, ntsc_num + len(jobs), width, height, None,
+                             comb_1h))
                 fi += 1
 
             if not jobs:
@@ -329,8 +339,10 @@ def cmd_image(args):
     print("Decoding from composite signal...")
     width = args.width or frame_rgb.shape[1]
     height = args.height or frame_rgb.shape[0]
+    comb_1h = getattr(args, 'comb_1h', False)
     result_rgb = decode_frame(signal, frame_number=0,
-                              output_width=width, output_height=height)
+                              output_width=width, output_height=height,
+                              comb_1h=comb_1h)
 
     result_bgr = cv2.cvtColor(result_rgb, cv2.COLOR_RGB2BGR)
     cv2.imwrite(args.output, result_bgr)
@@ -391,6 +403,8 @@ Examples:
     p_dec.add_argument('-o', '--output', default='output.mp4', help='Output video file')
     p_dec.add_argument('--width', type=int, default=640, help='Output width')
     p_dec.add_argument('--height', type=int, default=480, help='Output height')
+    p_dec.add_argument('--comb-1h', action='store_true',
+                       help='Use 1H line-delay comb filter (reduces rainbow, adds hanging dots)')
 
     # roundtrip
     p_rt = subparsers.add_parser('roundtrip', help='Video -> composite -> video')
@@ -400,6 +414,8 @@ Examples:
     p_rt.add_argument('--height', type=int, default=480, help='Output height')
     p_rt.add_argument('--telecine', action='store_true',
                       help='Simulate 3:2 pulldown telecine (480i, 4 film frames -> 5 NTSC frames)')
+    p_rt.add_argument('--comb-1h', action='store_true',
+                      help='Use 1H line-delay comb filter (reduces rainbow, adds hanging dots)')
 
     # image
     p_img = subparsers.add_parser('image', help='Roundtrip a single image through NTSC')
@@ -407,6 +423,8 @@ Examples:
     p_img.add_argument('-o', '--output', default='output.png', help='Output image file')
     p_img.add_argument('--width', type=int, default=None, help='Output width (default: same as input)')
     p_img.add_argument('--height', type=int, default=None, help='Output height (default: same as input)')
+    p_img.add_argument('--comb-1h', action='store_true',
+                       help='Use 1H line-delay comb filter (reduces rainbow, adds hanging dots)')
     p_img.add_argument('--wav', default=None, help='Also export full-rate composite WAV')
     p_img.add_argument('--preview', default=None, help='Also export 48 kHz preview WAV')
 

@@ -27,10 +27,21 @@ _BURST_START = FRONT_PORCH_SAMPLES + HSYNC_SAMPLES + BREEZEWAY_SAMPLES
 _ACTIVE_INDICES = np.arange(ACTIVE_SAMPLES, dtype=np.float64) + _ACTIVE_START
 _BURST_INDICES = np.arange(BURST_SAMPLES, dtype=np.float64) + _BURST_START
 
+# Padding for FIR filter settling on right edge.
+# Active region ends at sample 910 (= SAMPLES_PER_LINE), so filtfilt has
+# no room to settle on the right. We pad with this many zero samples.
+_RIGHT_PAD = _NUM_TAPS
+
 # Precompute visible line -> absolute line mapping
 _ABS_LINES = np.empty(VISIBLE_LINES, dtype=np.int32)
 _ABS_LINES[0::2] = np.arange(20, 260)
 _ABS_LINES[1::2] = np.arange(283, 523)
+
+# Precompute 1H comb reference lines (adjacent line in same field).
+# First line of each field uses the next line since there's no previous.
+_REF_LINES = _ABS_LINES - 1
+_REF_LINES[0] = _ABS_LINES[0] + 1   # field 1 first line: use next
+_REF_LINES[1] = _ABS_LINES[1] + 1   # field 2 first line: use next
 
 
 def _filtfilt_2d(coeffs, data_2d):
@@ -41,7 +52,8 @@ def _filtfilt_2d(coeffs, data_2d):
     return filtfilt(coeffs, 1.0, data_2d, axis=1)
 
 
-def decode_frame(signal, frame_number=0, output_width=640, output_height=480):
+def decode_frame(signal, frame_number=0, output_width=640, output_height=480,
+                 comb_1h=False):
     """Decode a composite NTSC signal back to an RGB frame (vectorized).
 
     Args:
@@ -49,6 +61,9 @@ def decode_frame(signal, frame_number=0, output_width=640, output_height=480):
         frame_number: Frame index.
         output_width: Output frame width in pixels.
         output_height: Output frame height in pixels.
+        comb_1h: Use 1H (one-line delay) comb filter instead of horizontal
+                 2-sample comb. Reduces cross-color rainbow artifacts but
+                 introduces hanging-dot artifacts at vertical transitions.
 
     Returns:
         RGB frame as numpy array (output_height x output_width x 3, uint8).
@@ -63,11 +78,19 @@ def decode_frame(signal, frame_number=0, output_width=640, output_height=480):
     full_lines = signal_2d[_ABS_LINES].copy()  # (480, 910)
 
     # --- Comb filter for luma/chroma separation (vectorized) ---
-    # 2-sample delay comb at 4xfsc separates luma and chroma
-    delayed = np.zeros_like(full_lines)
-    delayed[:, 2:] = full_lines[:, :-2]
-    y_full = (full_lines + delayed) / 2.0
-    chroma_full = (full_lines - delayed) / 2.0
+    if comb_1h:
+        # 1H comb: use adjacent line in same field as reference.
+        # Subcarrier phase flips π between consecutive lines, so adding
+        # cancels chroma and subtracting cancels luma.
+        ref_lines = signal_2d[_REF_LINES]  # (480, 910)
+        y_full = (full_lines + ref_lines) / 2.0
+        chroma_full = (full_lines - ref_lines) / 2.0
+    else:
+        # Horizontal 2-sample delay comb at 4xfsc
+        delayed = np.zeros_like(full_lines)
+        delayed[:, 2:] = full_lines[:, :-2]
+        y_full = (full_lines + delayed) / 2.0
+        chroma_full = (full_lines - delayed) / 2.0
 
     # Undo composite voltage scaling on luma
     y_full = (y_full - COMPOSITE_OFFSET) / COMPOSITE_SCALE
@@ -85,13 +108,12 @@ def decode_frame(signal, frame_number=0, output_width=640, output_height=480):
     sin_corr = np.sum(burst_all * sin_ref, axis=1)
     burst_phase = np.arctan2(sin_corr, cos_corr) - np.pi  # (480,)
 
-    # --- Chroma demodulation on full lines (vectorized) ---
-    # Zero out chroma in the blanking region (everything before active start).
-    # The burst was already used for phase detection above, so we null it out
-    # to prevent the colorburst from leaking through the FIR filter into the
-    # first ~100 samples of the active picture.
+    # --- Chroma demodulation (vectorized) ---
+    # Zero out chroma in the blanking region (before active start).
+    # The burst was already used for phase detection above, so we null it
+    # to prevent the colorburst from leaking through the FIR filter into
+    # the left edge of the active picture.
     chroma_full[:, :_ACTIVE_START] = 0.0
-    chroma_full[:, _ACTIVE_START + ACTIVE_SAMPLES:] = 0.0
 
     # Carrier phase for each line's FULL sample range
     full_indices = np.arange(SAMPLES_PER_LINE, dtype=np.float64)
@@ -102,10 +124,16 @@ def decode_frame(signal, frame_number=0, output_width=640, output_height=480):
     i_raw = 2.0 * chroma_full * np.cos(full_omega + I_PHASE_RAD)
     q_raw = 2.0 * chroma_full * np.cos(full_omega + Q_PHASE_RAD)
 
-    # Low-pass filter full lines — filters now have zero-padded blanking
-    # region to settle on cleanly before reaching active picture
-    i_full = _filtfilt_2d(_FIR_I, i_raw)
-    q_full = _filtfilt_2d(_FIR_Q, q_raw)
+    # Pad the right edge with zeros before filtering.
+    # The active region ends at sample 910 (= SAMPLES_PER_LINE), leaving
+    # filtfilt no room to settle on the right. Adding zero-padding prevents
+    # the backward pass from creating color bleed on the right edge.
+    i_raw = np.pad(i_raw, ((0, 0), (0, _RIGHT_PAD)), mode='constant')
+    q_raw = np.pad(q_raw, ((0, 0), (0, _RIGHT_PAD)), mode='constant')
+
+    # Low-pass filter padded lines, then strip padding
+    i_full = _filtfilt_2d(_FIR_I, i_raw)[:, :SAMPLES_PER_LINE]
+    q_full = _filtfilt_2d(_FIR_Q, q_raw)[:, :SAMPLES_PER_LINE]
 
     # Crop to active region after filtering
     y_all = y_full[:, _ACTIVE_START:_ACTIVE_START + ACTIVE_SAMPLES]
