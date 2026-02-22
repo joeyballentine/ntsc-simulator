@@ -4,9 +4,9 @@ A Python tool that simulates the NTSC composite video signal encoding and decodi
 
 ## Features
 
-- **Encode** video frames into a composite NTSC signal (saved as WAV at 4x subcarrier rate)
-- **Decode** a composite signal back into video
-- **Roundtrip** video through the full encode/decode pipeline
+- **Roundtrip** video through the full encode/decode pipeline in memory
+- **Encode** video frames into a composite NTSC signal (saved as `.npy`)
+- **Decode** a previously exported composite signal back into video
 - **Telecine** simulation with 3:2 pulldown (24p film to 480i interlaced)
 - **Image** processing through the NTSC signal path
 - **SMPTE color bars** test pattern generator
@@ -44,13 +44,13 @@ python main.py roundtrip input.mp4 -o output.mp4 --telecine
 ### Encode video to composite signal
 
 ```bash
-python main.py encode input.mp4 -o signal.wav
+python main.py encode input.mp4 -o signal.npy
 ```
 
 ### Decode composite signal to video
 
 ```bash
-python main.py decode signal.wav -o output.mp4 --width 640 --height 480
+python main.py decode signal.npy -o output.mp4 --width 640 --height 480
 ```
 
 ### Process a single image
@@ -62,7 +62,7 @@ python main.py image photo.png -o ntsc_photo.png
 ### Generate SMPTE color bars
 
 ```bash
-python main.py colorbars -o bars.wav --save-png
+python main.py colorbars -o colorbars.npy --save-png bars.png
 ```
 
 ### Options
@@ -74,8 +74,8 @@ python main.py colorbars -o bars.wav --save-png
 | `--height` | decode, roundtrip, image | Output height (default: 480) |
 | `--telecine` | roundtrip | Enable 3:2 pulldown telecine |
 | `--comb-1h` | decode, roundtrip, image | Use 1H line-delay comb filter instead of 2-sample delay |
-| `--wav` | image | Export full-rate composite WAV |
-| `--preview` | image, colorbars | Export 48 kHz preview WAV |
+| `--signal` | image | Also export the composite signal as `.npy` |
+| `--wav` | encode, image, colorbars | Export signal as a WAV file (stretched to 48 kHz for viewing in audio editors) |
 | `--save-png` | colorbars | Save the source SMPTE pattern as PNG |
 
 Run `python main.py <command> -h` for full details on any subcommand.
