@@ -17,7 +17,8 @@ class FFmpegWriter:
     Supports interlaced output with proper field flags.
     """
 
-    def __init__(self, filepath, width, height, fps=29.97, interlaced=False):
+    def __init__(self, filepath, width, height, fps=29.97, interlaced=False,
+                 crf=17, preset='fast'):
         self.width = width
         self.height = height
 
@@ -40,8 +41,8 @@ class FFmpegWriter:
 
         cmd += [
             '-c:v', 'libx264',
-            '-preset', 'fast',
-            '-crf', '17',
+            '-preset', preset,
+            '-crf', str(crf),
             '-pix_fmt', 'yuv420p',
             filepath,
         ]
@@ -76,10 +77,12 @@ class CV2Writer:
         self.out.release()
 
 
-def _make_writer(filepath, width, height, fps=29.97, interlaced=False):
+def _make_writer(filepath, width, height, fps=29.97, interlaced=False,
+                 crf=17, preset='fast'):
     """Create a video writer, preferring ffmpeg for interlaced output."""
     if shutil.which('ffmpeg'):
-        return FFmpegWriter(filepath, width, height, fps, interlaced)
+        return FFmpegWriter(filepath, width, height, fps, interlaced,
+                            crf=crf, preset=preset)
     if interlaced:
         print("Warning: ffmpeg not found, interlace flags will not be set")
     return CV2Writer(filepath, width, height, fps)
@@ -194,7 +197,8 @@ def cmd_decode(args):
 
     width = args.width
     height = args.height
-    out = _make_writer(args.output, width, height)
+    out = _make_writer(args.output, width, height,
+                       crf=args.crf, preset=args.preset)
 
     comb_1h = getattr(args, 'comb_1h', False)
     for i in tqdm(range(num_frames), unit='frame', desc='Decoding'):
@@ -238,13 +242,18 @@ def cmd_roundtrip(args):
 
     comb_1h = getattr(args, 'comb_1h', False)
 
+    crf = args.crf
+    preset = args.preset
+
     if args.telecine:
-        out = _make_writer(args.output, width, height, fps=29.97, interlaced=True)
+        out = _make_writer(args.output, width, height, fps=29.97, interlaced=True,
+                           crf=crf, preset=preset)
         print(f"Roundtrip (3:2 telecine 480i): {args.input} -> composite -> {args.output}")
         print(f"  Output: {width}x{height} 29.97fps interlaced (TFF), {workers} workers")
         _roundtrip_telecine(cap, out, width, height, total_frames, workers, comb_1h)
     else:
-        out = _make_writer(args.output, width, height, fps=29.97, interlaced=False)
+        out = _make_writer(args.output, width, height, fps=29.97, interlaced=False,
+                           crf=crf, preset=preset)
         print(f"Roundtrip (progressive): {args.input} -> composite -> {args.output}")
         print(f"  Output: {width}x{height} 29.97fps progressive, {workers} workers")
         _roundtrip_progressive(cap, out, width, height, total_frames, workers, comb_1h)
@@ -448,6 +457,9 @@ Examples:
     p_dec.add_argument('--height', type=int, default=480, help='Output height')
     p_dec.add_argument('--comb-1h', action='store_true',
                        help='Use 1H line-delay comb filter (reduces rainbow, adds hanging dots)')
+    p_dec.add_argument('--crf', type=int, default=17, help='x264 CRF quality (0=lossless, 51=worst, default: 17)')
+    p_dec.add_argument('--preset', default='fast',
+                       help='x264 preset (ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow, default: fast)')
 
     # roundtrip
     p_rt = subparsers.add_parser('roundtrip', help='Video -> composite -> video')
@@ -459,6 +471,9 @@ Examples:
                       help='Simulate 3:2 pulldown telecine (480i, 4 film frames -> 5 NTSC frames)')
     p_rt.add_argument('--comb-1h', action='store_true',
                       help='Use 1H line-delay comb filter (reduces rainbow, adds hanging dots)')
+    p_rt.add_argument('--crf', type=int, default=17, help='x264 CRF quality (0=lossless, 51=worst, default: 17)')
+    p_rt.add_argument('--preset', default='fast',
+                      help='x264 preset (ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow, default: fast)')
 
     # image
     p_img = subparsers.add_parser('image', help='Roundtrip a single image through NTSC')

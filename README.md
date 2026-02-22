@@ -74,6 +74,8 @@ python main.py colorbars -o colorbars.npy --save-png bars.png
 | `--height` | decode, roundtrip, image | Output height (default: 480) |
 | `--telecine` | roundtrip | Enable 3:2 pulldown telecine |
 | `--comb-1h` | decode, roundtrip, image | Use 1H line-delay comb filter instead of 2-sample delay |
+| `--crf` | decode, roundtrip | x264 CRF quality, 0=lossless, 51=worst (default: 17) |
+| `--preset` | decode, roundtrip | x264 encoding preset, e.g. `ultrafast`, `fast`, `slow` (default: fast) |
 | `--signal` | image | Also export the composite signal as `.npy` |
 | `--wav` | encode, image, colorbars | Export signal as a WAV file (stretched to 48 kHz for viewing in audio editors) |
 | `--save-png` | colorbars | Save the source SMPTE pattern as PNG |
