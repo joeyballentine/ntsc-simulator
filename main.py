@@ -25,7 +25,6 @@ _STANDARD_RATES = [
 ]
 
 
-<<<<<<< HEAD
 # File extensions recognised as processable media.
 _VIDEO_EXTENSIONS = {
     '.mp4', '.mkv', '.mov', '.avi', '.wmv', '.flv',
@@ -57,8 +56,6 @@ def _batch_output_path(output_dir, input_path, new_ext=None):
     return os.path.join(output_dir, name)
 
 
-=======
->>>>>>> 44de651c030de8dff4ee611e571c806b78308c8d
 def _fps_to_rational(fps):
     """Return an ffmpeg-compatible rational string for *fps*.
 

@@ -15,3 +15,5 @@ venv/
 # Allow example images
 !examples/
 !examples/*.png
+input/
+output/
