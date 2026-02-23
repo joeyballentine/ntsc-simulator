@@ -132,6 +132,9 @@ enum Commands {
         /// x264 preset
         #[arg(long, default_value = "fast")]
         preset: String,
+        /// Lossless output (FFV1 for .mkv, x264 QP 0 for .mp4)
+        #[arg(long)]
+        lossless: bool,
         /// Number of parallel worker threads (default: all logical cores)
         #[arg(long)]
         threads: Option<usize>,
@@ -205,6 +208,7 @@ fn main() -> Result<()> {
             comb_1h,
             crf,
             preset,
+            lossless,
             threads,
             telecine,
             effects,
@@ -232,17 +236,17 @@ fn main() -> Result<()> {
                     let inp = path.to_string_lossy();
                     let outp = out_path.to_string_lossy();
                     if telecine {
-                        cmd_roundtrip_telecine(&inp, &outp, width, height, comb_1h, crf, &preset, threads, &effects, &prefix)?;
+                        cmd_roundtrip_telecine(&inp, &outp, width, height, comb_1h, crf, &preset, lossless, threads, &effects, &prefix)?;
                     } else {
-                        cmd_roundtrip(&inp, &outp, width, height, comb_1h, crf, &preset, threads, &effects, &prefix)?;
+                        cmd_roundtrip(&inp, &outp, width, height, comb_1h, crf, &preset, lossless, threads, &effects, &prefix)?;
                     }
                 }
                 Ok(())
             } else {
                 if telecine {
-                    cmd_roundtrip_telecine(&input, &output, width, height, comb_1h, crf, &preset, threads, &effects, "")
+                    cmd_roundtrip_telecine(&input, &output, width, height, comb_1h, crf, &preset, lossless, threads, &effects, "")
                 } else {
-                    cmd_roundtrip(&input, &output, width, height, comb_1h, crf, &preset, threads, &effects, "")
+                    cmd_roundtrip(&input, &output, width, height, comb_1h, crf, &preset, lossless, threads, &effects, "")
                 }
             }
         }
@@ -406,6 +410,7 @@ fn cmd_roundtrip(
     comb_1h: bool,
     crf: u32,
     preset: &str,
+    lossless: bool,
     threads: Option<usize>,
     effects_args: &EffectsArgs,
     prefix: &str,
@@ -428,7 +433,7 @@ fn cmd_roundtrip(
     let frame_bytes = in_w * in_h * 3;
 
     let mut reader = spawn_ffmpeg_reader(input)?;
-    let mut writer = spawn_ffmpeg_writer(output, out_w, out_h, &fps_raw, preset, crf, false)?;
+    let mut writer = spawn_ffmpeg_writer(output, out_w, out_h, &fps_raw, preset, crf, false, lossless)?;
 
     let reader_stdout = reader.stdout.take().unwrap();
     let mut reader_buf = std::io::BufReader::new(reader_stdout);
@@ -559,6 +564,7 @@ fn cmd_roundtrip_telecine(
     comb_1h: bool,
     crf: u32,
     preset: &str,
+    lossless: bool,
     threads: Option<usize>,
     effects_args: &EffectsArgs,
     prefix: &str,
@@ -581,7 +587,7 @@ fn cmd_roundtrip_telecine(
     let frame_bytes = in_w * in_h * 3;
 
     let mut reader = spawn_ffmpeg_reader(input)?;
-    let mut writer = spawn_ffmpeg_writer(output, out_w, out_h, "30000/1001", preset, crf, true)?;
+    let mut writer = spawn_ffmpeg_writer(output, out_w, out_h, "30000/1001", preset, crf, true, lossless)?;
 
     let reader_stdout = reader.stdout.take().unwrap();
     let mut reader_buf = std::io::BufReader::new(reader_stdout);
@@ -786,6 +792,7 @@ fn spawn_ffmpeg_writer(
     preset: &str,
     crf: u32,
     interlaced: bool,
+    lossless: bool,
 ) -> Result<std::process::Child> {
     let mut args = vec![
         "-y".to_string(),
@@ -812,15 +819,45 @@ fn spawn_ffmpeg_writer(
         ]);
     }
 
+    if lossless {
+        if output.ends_with(".mkv") {
+            // FFV1 lossless in MKV
+            args.extend([
+                "-c:v".to_string(),
+                "ffv1".to_string(),
+                "-level".to_string(),
+                "3".to_string(),
+                "-pix_fmt".to_string(),
+                "yuv444p".to_string(),
+            ]);
+        } else {
+            // x264 lossless (QP 0) in MP4
+            args.extend([
+                "-c:v".to_string(),
+                "libx264".to_string(),
+                "-preset".to_string(),
+                preset.to_string(),
+                "-qp".to_string(),
+                "0".to_string(),
+                "-pix_fmt".to_string(),
+                "yuv444p".to_string(),
+            ]);
+        }
+    } else {
+        // Lossy path
+        args.extend([
+            "-c:v".to_string(),
+            "libx264".to_string(),
+            "-preset".to_string(),
+            preset.to_string(),
+            "-crf".to_string(),
+            format!("{}", crf),
+            "-pix_fmt".to_string(),
+            "yuv420p".to_string(),
+        ]);
+    }
+
     args.extend([
-        "-c:v".to_string(),
-        "libx264".to_string(),
-        "-preset".to_string(),
-        preset.to_string(),
-        "-crf".to_string(),
-        format!("{}", crf),
-        "-pix_fmt".to_string(),
-        "yuv420p".to_string(),
         "-v".to_string(),
         "error".to_string(),
         output.to_string(),

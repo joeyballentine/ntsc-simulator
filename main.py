@@ -80,7 +80,7 @@ class FFmpegWriter:
     """
 
     def __init__(self, filepath, width, height, fps=29.97, interlaced=False,
-                 crf=17, preset='fast'):
+                 crf=17, preset='fast', lossless=False):
         self.width = width
         self.height = height
 
@@ -101,13 +101,17 @@ class FFmpegWriter:
                 '-top', '1',
             ]
 
-        cmd += [
-            '-c:v', 'libx264',
-            '-preset', preset,
-            '-crf', str(crf),
-            '-pix_fmt', 'yuv420p',
-            filepath,
-        ]
+        if lossless:
+            if filepath.endswith('.mkv'):
+                cmd += ['-c:v', 'ffv1', '-level', '3', '-pix_fmt', 'yuv444p']
+            else:
+                cmd += ['-c:v', 'libx264', '-preset', preset, '-qp', '0',
+                        '-pix_fmt', 'yuv444p']
+        else:
+            cmd += ['-c:v', 'libx264', '-preset', preset, '-crf', str(crf),
+                    '-pix_fmt', 'yuv420p']
+
+        cmd += [filepath]
 
         self.proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE,
@@ -140,11 +144,11 @@ class CV2Writer:
 
 
 def _make_writer(filepath, width, height, fps=29.97, interlaced=False,
-                 crf=17, preset='fast'):
+                 crf=17, preset='fast', lossless=False):
     """Create a video writer, preferring ffmpeg for interlaced output."""
     if shutil.which('ffmpeg'):
         return FFmpegWriter(filepath, width, height, fps, interlaced,
-                            crf=crf, preset=preset)
+                            crf=crf, preset=preset, lossless=lossless)
     if interlaced:
         print("Warning: ffmpeg not found, interlace flags will not be set")
     return CV2Writer(filepath, width, height, fps)
@@ -461,19 +465,20 @@ def _roundtrip_one(input_path, output_path, args, workers, batch_label=None):
     comb_1h = getattr(args, 'comb_1h', False)
     crf = args.crf
     preset = args.preset
+    lossless = getattr(args, 'lossless', False)
     effects = _build_effects_dict(args)
     desc = batch_label or 'Processing'
 
     if args.telecine:
         out = _make_writer(output_path, width, height, fps=29.97, interlaced=True,
-                           crf=crf, preset=preset)
+                           crf=crf, preset=preset, lossless=lossless)
         print(f"Roundtrip (3:2 telecine 480i): {input_path} -> composite -> {output_path}")
         print(f"  Input: {input_fps:.3f}fps, Output: {width}x{height} 29.97fps interlaced (TFF), {workers} workers")
         _roundtrip_telecine(cap, out, width, height, total_frames, workers,
                             comb_1h, effects, desc=desc)
     else:
         out = _make_writer(output_path, width, height, fps=input_fps, interlaced=False,
-                           crf=crf, preset=preset)
+                           crf=crf, preset=preset, lossless=lossless)
         print(f"Roundtrip (progressive): {input_path} -> composite -> {output_path}")
         print(f"  Output: {width}x{height} {input_fps:.3f}fps progressive, {workers} workers")
         _roundtrip_progressive(cap, out, width, height, total_frames, workers,
@@ -766,6 +771,8 @@ Examples:
     p_rt.add_argument('--crf', type=int, default=17, help='x264 CRF quality (0=lossless, 51=worst, default: 17)')
     p_rt.add_argument('--preset', default='fast',
                       help='x264 preset (ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow, default: fast)')
+    p_rt.add_argument('--lossless', action='store_true',
+                      help='Lossless output (FFV1 for .mkv, x264 QP 0 for .mp4)')
     _add_effect_args(p_rt)
 
     # image
