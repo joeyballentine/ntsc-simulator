@@ -167,14 +167,8 @@ def _read_input(path):
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     raw_fps = cap.get(cv2.CAP_PROP_FPS) or 29.97
     # Snap imprecise container FPS values to the nearest standard rate.
-    fps = raw_fps
-    best_rate, best_diff = None, float('inf')
-    for num, den in _STANDARD_RATES:
-        diff = abs(raw_fps - num / den)
-        if diff < best_diff:
-            best_diff, best_rate = diff, num / den
-    if best_diff < 0.1:
-        fps = best_rate
+    num, den = map(int, _fps_to_rational(raw_fps).split('/'))
+    fps = num / den
     return cap, total, fps
 
 
