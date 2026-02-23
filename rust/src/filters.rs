@@ -1,4 +1,4 @@
-/// FIR filter design and FFT-based zero-phase filtering using real FFT.
+//! FIR filter design and FFT-based zero-phase filtering using real FFT.
 
 use realfft::num_complex::Complex;
 use realfft::{RealFftPlanner, RealToComplex, ComplexToReal};
@@ -14,7 +14,7 @@ pub fn design_lowpass(cutoff_hz: f64, num_taps: usize) -> Vec<f32> {
     let half = (num_taps - 1) as f64 / 2.0;
     let mut coeffs = vec![0.0f64; num_taps];
 
-    for i in 0..num_taps {
+    for (i, coeff) in coeffs.iter_mut().enumerate() {
         let n = i as f64 - half;
         let window =
             0.54 - 0.46 * (2.0 * std::f64::consts::PI * i as f64 / (num_taps - 1) as f64).cos();
@@ -23,7 +23,7 @@ pub fn design_lowpass(cutoff_hz: f64, num_taps: usize) -> Vec<f32> {
         } else {
             (std::f64::consts::PI * normalized_cutoff * n).sin() / (std::f64::consts::PI * n)
         };
-        coeffs[i] = sinc * window;
+        *coeff = sinc * window;
     }
 
     let sum: f64 = coeffs.iter().sum();
@@ -32,15 +32,6 @@ pub fn design_lowpass(cutoff_hz: f64, num_taps: usize) -> Vec<f32> {
     }
 
     coeffs.iter().map(|&c| c as f32).collect()
-}
-
-/// Find the next power of 2 >= n.
-fn next_pow2(n: usize) -> usize {
-    let mut p = 1;
-    while p < n {
-        p <<= 1;
-    }
-    p
 }
 
 /// Precomputed filter kernel in frequency domain using real FFT.
@@ -52,14 +43,12 @@ pub struct FilterKernel {
     fft_n: usize,
     /// Expected input signal length
     signal_len: usize,
-    /// Number of complex frequency bins (fft_n/2 + 1)
-    freq_bins: usize,
 }
 
 impl FilterKernel {
     /// Create a precomputed filter kernel for signals of length `signal_len`.
     pub fn new(coeffs: &[f32], signal_len: usize) -> Self {
-        let fft_n = next_pow2(signal_len + coeffs.len() - 1);
+        let fft_n = (signal_len + coeffs.len() - 1).next_power_of_two();
         let freq_bins = fft_n / 2 + 1;
 
         // R2C FFT of filter coefficients
@@ -78,7 +67,6 @@ impl FilterKernel {
             h_squared,
             fft_n,
             signal_len,
-            freq_bins,
         }
     }
 
@@ -88,10 +76,6 @@ impl FilterKernel {
 
     pub fn signal_len(&self) -> usize {
         self.signal_len
-    }
-
-    pub fn freq_bins(&self) -> usize {
-        self.freq_bins
     }
 
     pub fn h_squared(&self) -> &[f32] {
@@ -109,9 +93,8 @@ pub struct FilterScratch {
 }
 
 impl FilterScratch {
-    /// Create scratch buffers for a given FFT size.
-    pub fn new(fft_n: usize) -> Self {
-        let mut planner = RealFftPlanner::<f32>::new();
+    /// Create scratch buffers for a given FFT size using a shared planner.
+    pub fn with_planner(planner: &mut RealFftPlanner<f32>, fft_n: usize) -> Self {
         let r2c = planner.plan_fft_forward(fft_n);
         let c2r = planner.plan_fft_inverse(fft_n);
         let freq_bins = fft_n / 2 + 1;
@@ -131,9 +114,7 @@ impl FilterScratch {
 
         // Copy signal into time buffer, zero-pad
         self.time_buf[..n].copy_from_slice(&row[..n]);
-        for v in &mut self.time_buf[n..] {
-            *v = 0.0;
-        }
+        self.time_buf[n..].fill(0.0);
 
         // Forward R2C FFT
         self.r2c
@@ -154,15 +135,15 @@ impl FilterScratch {
 
         // Normalize and copy back
         let scale = 1.0 / self.fft_n as f32;
-        for i in 0..n {
-            row[i] = self.time_buf[i] * scale;
+        for (dst, &src) in row[..n].iter_mut().zip(self.time_buf[..n].iter()) {
+            *dst = src * scale;
         }
     }
 }
 
 /// Apply zero-phase FFT filter to multiple rows sequentially, reusing scratch buffers.
 pub fn filter_rows_sequential(kernel: &FilterKernel, data: &mut [f32], row_len: usize, scratch: &mut FilterScratch) {
-    for row in data.chunks_mut(row_len) {
+    for row in data.chunks_exact_mut(row_len) {
         scratch.apply(kernel, row);
     }
 }

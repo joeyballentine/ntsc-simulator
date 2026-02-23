@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 mod constants;
 mod decoder;
 mod encoder;
@@ -9,6 +7,7 @@ use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
@@ -71,7 +70,7 @@ enum Commands {
     },
 }
 
-fn main() {
+fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -95,11 +94,8 @@ fn main() {
     }
 }
 
-fn cmd_image(input: &str, output: &str, width: Option<u32>, height: Option<u32>, comb_1h: bool) {
-    let img = image::open(input).unwrap_or_else(|e| {
-        eprintln!("Error: Cannot open image '{}': {}", input, e);
-        std::process::exit(1);
-    });
+fn cmd_image(input: &str, output: &str, width: Option<u32>, height: Option<u32>, comb_1h: bool) -> Result<()> {
+    let img = image::open(input).with_context(|| format!("Cannot open image '{}'", input))?;
 
     let img_rgb = img.to_rgb8();
     let (w, h) = (img_rgb.width() as usize, img_rgb.height() as usize);
@@ -120,7 +116,7 @@ fn cmd_image(input: &str, output: &str, width: Option<u32>, height: Option<u32>,
     eprintln!("Decoding from composite signal...");
     let mut decoder = Decoder::new();
     let t0 = Instant::now();
-    let result_rgb = decoder.decode_frame(&signal, 0, out_w, out_h, comb_1h);
+    let result_rgb = decoder.decode_frame(signal, out_w, out_h, comb_1h);
     let decode_ms = t0.elapsed().as_secs_f64() * 1000.0;
     eprintln!("  Decode: {:.1} ms", decode_ms);
     eprintln!(
@@ -131,15 +127,15 @@ fn cmd_image(input: &str, output: &str, width: Option<u32>, height: Option<u32>,
 
     // Save output
     let out_img =
-        image::RgbImage::from_raw(out_w as u32, out_h as u32, result_rgb).expect("image creation");
-    out_img.save(output).unwrap_or_else(|e| {
-        eprintln!("Error: Cannot save image '{}': {}", output, e);
-        std::process::exit(1);
-    });
+        image::RgbImage::from_raw(out_w as u32, out_h as u32, result_rgb.to_vec())
+            .context("Failed to create output image")?;
+    out_img.save(output).with_context(|| format!("Cannot save image '{}'", output))?;
 
     eprintln!("Output: {} ({}x{})", output, out_w, out_h);
+    Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_roundtrip(
     input: &str,
     output: &str,
@@ -149,12 +145,11 @@ fn cmd_roundtrip(
     crf: u32,
     preset: &str,
     threads: Option<usize>,
-) {
+) -> Result<()> {
     let out_w = width as usize;
     let out_h = height as usize;
 
-    // Probe input video for dimensions, fps, and frame count
-    let (in_w, in_h, fps, total_frames) = ffprobe_video(input);
+    let (in_w, in_h, fps, total_frames) = ffprobe_video(input)?;
     eprintln!(
         "Input: {} ({}x{} @ {:.3} fps, {} frames)",
         input, in_w, in_h, fps, total_frames
@@ -166,7 +161,6 @@ fn cmd_roundtrip(
 
     let frame_bytes = in_w * in_h * 3;
 
-    // Spawn ffmpeg reader: decode input to raw RGB
     let mut reader = Command::new("ffmpeg")
         .args([
             "-i",
@@ -182,9 +176,8 @@ fn cmd_roundtrip(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("Failed to spawn ffmpeg reader. Is ffmpeg installed?");
+        .context("Failed to spawn ffmpeg reader. Is ffmpeg installed?")?;
 
-    // Spawn ffmpeg writer: encode raw RGB to output
     let mut writer = Command::new("ffmpeg")
         .args([
             "-y",
@@ -213,7 +206,7 @@ fn cmd_roundtrip(
         .stdin(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("Failed to spawn ffmpeg writer. Is ffmpeg installed?");
+        .context("Failed to spawn ffmpeg writer. Is ffmpeg installed?")?;
 
     let reader_stdout = reader.stdout.take().unwrap();
     let mut reader_buf = std::io::BufReader::new(reader_stdout);
@@ -263,14 +256,18 @@ fn cmd_roundtrip(
         static TL_DECODER: RefCell<Decoder> = RefCell::new(Decoder::new());
     }
 
+    // Pre-allocate frame read buffers for the batch to avoid per-frame allocation
+    let mut frame_pool: Vec<Vec<u8>> = (0..batch_size)
+        .map(|_| vec![0u8; frame_bytes])
+        .collect();
+
     loop {
-        // Read a batch of frames
-        let mut batch: Vec<(Vec<u8>, u32)> = Vec::with_capacity(batch_size);
-        for _ in 0..batch_size {
-            let mut frame_buf = vec![0u8; frame_bytes];
-            match reader_buf.read_exact(&mut frame_buf) {
+        // Read a batch of frames, reusing pooled buffers
+        let mut batch_count = 0usize;
+        for buf in frame_pool.iter_mut() {
+            match reader_buf.read_exact(buf) {
                 Ok(()) => {
-                    batch.push((frame_buf, frame_num + batch.len() as u32));
+                    batch_count += 1;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
                 Err(e) => {
@@ -280,21 +277,27 @@ fn cmd_roundtrip(
             }
         }
 
-        if batch.is_empty() {
+        if batch_count == 0 {
             break;
         }
 
-        let batch_len = batch.len() as u32;
+        // Build references for the active batch items
+        let batch_items: Vec<(&[u8], u32)> = (0..batch_count)
+            .map(|i| (frame_pool[i].as_slice(), frame_num + i as u32))
+            .collect();
 
         // Process all frames in the batch in parallel, each thread
         // uses its own encoder/decoder with reused scratch buffers
-        let results: Vec<Vec<u8>> = batch
+        let results: Vec<Vec<u8>> = batch_items
             .par_iter()
             .map(|(frame_buf, fnum)| {
                 TL_ENCODER.with(|enc| {
                     TL_DECODER.with(|dec| {
-                        let signal = enc.borrow_mut().encode_frame(frame_buf, in_w, in_h, *fnum);
-                        dec.borrow_mut().decode_frame(&signal, *fnum, out_w, out_h, comb_1h)
+                        let mut enc_ref = enc.borrow_mut();
+                        let signal = enc_ref.encode_frame(frame_buf, in_w, in_h, *fnum);
+                        let mut dec_ref = dec.borrow_mut();
+                        let result = dec_ref.decode_frame(signal, out_w, out_h, comb_1h);
+                        result.to_vec()
                     })
                 })
             })
@@ -302,11 +305,11 @@ fn cmd_roundtrip(
 
         // Write results in order
         for result in &results {
-            writer_buf.write_all(result).expect("write failed");
+            writer_buf.write_all(result).context("write failed")?;
         }
 
-        frame_num += batch_len;
-        pb.inc(batch_len as u64);
+        frame_num += batch_count as u32;
+        pb.inc(batch_count as u64);
 
         let elapsed = total_start.elapsed().as_secs_f64();
         let fps_actual = frame_num as f64 / elapsed;
@@ -329,10 +332,10 @@ fn cmd_roundtrip(
 
     // Mux audio from source
     mux_audio(input, output);
+    Ok(())
 }
 
-/// Use ffprobe to get video width, height, fps, and frame count.
-fn ffprobe_video(path: &str) -> (usize, usize, f64, usize) {
+fn ffprobe_video(path: &str) -> Result<(usize, usize, f64, usize)> {
     let output = Command::new("ffprobe")
         .args([
             "-v",
@@ -346,20 +349,18 @@ fn ffprobe_video(path: &str) -> (usize, usize, f64, usize) {
             path,
         ])
         .output()
-        .expect("Failed to run ffprobe. Is ffmpeg installed?");
+        .context("Failed to run ffprobe. Is ffmpeg installed?")?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let parts: Vec<&str> = stdout.trim().split(',').collect();
 
     if parts.len() < 3 {
-        eprintln!("Error: Cannot probe video '{}'. ffprobe output: {}", path, stdout);
-        std::process::exit(1);
+        bail!("Cannot probe video '{}'. ffprobe output: {}", path, stdout);
     }
 
     let w: usize = parts[0].parse().unwrap_or(640);
     let h: usize = parts[1].parse().unwrap_or(480);
 
-    // r_frame_rate comes as "num/den"
     let fps = if let Some((num, den)) = parts[2].split_once('/') {
         let n: f64 = num.parse().unwrap_or(30000.0);
         let d: f64 = den.parse().unwrap_or(1001.0);
@@ -368,18 +369,15 @@ fn ffprobe_video(path: &str) -> (usize, usize, f64, usize) {
         parts[2].parse().unwrap_or(29.97)
     };
 
-    // nb_frames may be "N/A" for some containers
     let total_frames: usize = parts
         .get(3)
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
 
-    (w, h, fps, total_frames)
+    Ok((w, h, fps, total_frames))
 }
 
-/// Copy audio from source into the output video file.
 fn mux_audio(source: &str, video_path: &str) {
-    // Check if source has audio
     let probe = Command::new("ffprobe")
         .args([
             "-v",
