@@ -11,6 +11,36 @@ import sys
 import numpy as np
 from tqdm import tqdm
 
+# Standard frame rates as (numerator, denominator) exact rationals.
+_STANDARD_RATES = [
+    (24000, 1001),  # 23.976 (film NTSC)
+    (24, 1),
+    (25, 1),        # PAL
+    (30000, 1001),  # 29.97 (NTSC)
+    (30, 1),
+    (48, 1),
+    (50, 1),        # PAL double
+    (60000, 1001),  # 59.94 (NTSC double)
+    (60, 1),
+]
+
+
+def _fps_to_rational(fps):
+    """Return an ffmpeg-compatible rational string for *fps*.
+
+    Snaps to the *closest* known NTSC/PAL standard rate within ±0.1 fps so
+    that floating-point imprecision from container metadata does not propagate into the output.
+    Falls back to a /1000 fraction for non-standard rates.
+    """
+    best_num, best_den, best_diff = None, None, float('inf')
+    for num, den in _STANDARD_RATES:
+        diff = abs(fps - num / den)
+        if diff < best_diff:
+            best_diff, best_num, best_den = diff, num, den
+    if best_diff < 0.1:
+        return f'{best_num}/{best_den}'
+    return f'{round(fps * 1000)}/1000'
+
 
 class FFmpegWriter:
     """Write video frames by piping raw RGB into ffmpeg.
@@ -28,7 +58,7 @@ class FFmpegWriter:
             '-f', 'rawvideo',
             '-pix_fmt', 'rgb24',
             '-s', f'{width}x{height}',
-            '-r', str(fps),
+            '-r', _fps_to_rational(fps),
             '-i', 'pipe:0',
         ]
 
@@ -135,7 +165,10 @@ def _read_input(path):
         print(f"Error: Cannot open video file '{path}'")
         sys.exit(1)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 29.97
+    raw_fps = cap.get(cv2.CAP_PROP_FPS) or 29.97
+    # Snap imprecise container FPS values to the nearest standard rate.
+    num, den = map(int, _fps_to_rational(raw_fps).split('/'))
+    fps = num / den
     return cap, total, fps
 
 
