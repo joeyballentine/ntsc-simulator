@@ -415,7 +415,7 @@ fn cmd_roundtrip(
     let fx = effects_args.to_signal_effects();
     let effects_active = fx.is_active();
 
-    let (in_w, in_h, fps, total_frames) = ffprobe_video(input)?;
+    let (in_w, in_h, fps, fps_raw, total_frames) = ffprobe_video(input)?;
     eprintln!(
         "Input: {} ({}x{} @ {:.3} fps, {} frames)",
         input, in_w, in_h, fps, total_frames
@@ -428,7 +428,7 @@ fn cmd_roundtrip(
     let frame_bytes = in_w * in_h * 3;
 
     let mut reader = spawn_ffmpeg_reader(input)?;
-    let mut writer = spawn_ffmpeg_writer(output, out_w, out_h, &format!("{}", fps), preset, crf, false)?;
+    let mut writer = spawn_ffmpeg_writer(output, out_w, out_h, &fps_raw, preset, crf, false)?;
 
     let reader_stdout = reader.stdout.take().unwrap();
     let mut reader_buf = std::io::BufReader::new(reader_stdout);
@@ -568,7 +568,7 @@ fn cmd_roundtrip_telecine(
     let fx = effects_args.to_signal_effects();
     let effects_active = fx.is_active();
 
-    let (in_w, in_h, _input_fps, total_frames) = ffprobe_video(input)?;
+    let (in_w, in_h, _input_fps, _fps_raw, total_frames) = ffprobe_video(input)?;
     eprintln!(
         "Input: {} ({}x{}, {} frames)",
         input, in_w, in_h, total_frames
@@ -836,7 +836,7 @@ fn spawn_ffmpeg_writer(
         .context("Failed to spawn ffmpeg writer. Is ffmpeg installed?")
 }
 
-fn ffprobe_video(path: &str) -> Result<(usize, usize, f64, usize)> {
+fn ffprobe_video(path: &str) -> Result<(usize, usize, f64, String, usize)> {
     let output = Command::new("ffprobe")
         .args([
             "-v",
@@ -862,6 +862,7 @@ fn ffprobe_video(path: &str) -> Result<(usize, usize, f64, usize)> {
     let w: usize = parts[0].parse().unwrap_or(640);
     let h: usize = parts[1].parse().unwrap_or(480);
 
+    let fps_raw = parts[2].to_string();
     let fps = if let Some((num, den)) = parts[2].split_once('/') {
         let n: f64 = num.parse().unwrap_or(30000.0);
         let d: f64 = den.parse().unwrap_or(1001.0);
@@ -875,7 +876,7 @@ fn ffprobe_video(path: &str) -> Result<(usize, usize, f64, usize)> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
 
-    Ok((w, h, fps, total_frames))
+    Ok((w, h, fps, fps_raw, total_frames))
 }
 
 fn mux_audio(source: &str, video_path: &str) {
