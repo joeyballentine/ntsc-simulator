@@ -683,10 +683,10 @@ def cmd_colorbars(args):
         export_wav(signal, args.wav)
         print(f"WAV: {args.wav}")
 
-    if args.save_png:
+    if args.save_source:
         import cv2
-        cv2.imwrite(args.save_png, cv2.cvtColor(bars, cv2.COLOR_RGB2BGR))
-        print(f"Saved source pattern: {args.save_png}")
+        cv2.imwrite(args.save_source, cv2.cvtColor(bars, cv2.COLOR_RGB2BGR))
+        print(f"Saved source pattern: {args.save_source}")
 
 
 def _add_effect_args(parser):
@@ -779,7 +779,7 @@ Examples:
     p_cb = subparsers.add_parser('colorbars', help='Generate color bar test signal')
     p_cb.add_argument('-o', '--output', default='colorbars.npy', help='Output signal file (.npy)')
     p_cb.add_argument('--wav', default=None, help='Also export as WAV (stretched to 48 kHz for audio editors)')
-    p_cb.add_argument('--save-png', default=None, help='Also save source pattern as PNG')
+    p_cb.add_argument('--save-source', default=None, help='Also save source pattern as PNG')
 
     args = parser.parse_args()
 

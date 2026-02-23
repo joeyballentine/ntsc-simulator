@@ -1,6 +1,8 @@
 # NTSC Composite Simulator
 
-A Python tool that simulates the NTSC composite video signal encoding and decoding pipeline. Process video or images through an accurate analog signal path to reproduce the characteristic artifacts of NTSC television — color bleeding, rainbow cross-color, dot crawl, and chroma/luma bandwidth limitations.
+Simulate the NTSC composite video signal encoding and decoding pipeline. Process video or images through an accurate analog signal path to reproduce the characteristic artifacts of NTSC television — color bleeding, rainbow cross-color, dot crawl, and chroma/luma bandwidth limitations.
+
+Available in both **Python** and **Rust** — the Rust version offers significantly faster processing with identical output.
 
 ## Examples
 
@@ -19,14 +21,14 @@ A Python tool that simulates the NTSC composite video signal encoding and decodi
 - **SMPTE color bars** test pattern generator
 - **Signal degradation effects**: noise (snow), ghosting, attenuation, horizontal jitter
 - **Two comb filter modes**: horizontal 2-sample delay (default) and 1H line-delay
-- Parallel frame processing via multiprocessing
+- Parallel frame processing (multiprocessing in Python, rayon in Rust)
 
 ## Requirements
 
+### Python
+
 - Python 3
 - [ffmpeg](https://ffmpeg.org/) (optional, for interlaced output and audio muxing)
-
-## Installation
 
 ```bash
 pip install -r requirements.txt
@@ -34,9 +36,21 @@ pip install -r requirements.txt
 
 Dependencies: `numpy`, `scipy`, `opencv-python`, `tqdm`
 
+### Rust
+
+- Rust toolchain (1.70+)
+- [ffmpeg](https://ffmpeg.org/) (for video I/O)
+
+```bash
+cd rust
+cargo build --release
+```
+
 ## Usage
 
-### Roundtrip (video through NTSC and back)
+### Python
+
+#### Roundtrip (video through NTSC and back)
 
 ```bash
 python main.py roundtrip input.mp4 -o output.mp4
@@ -48,31 +62,31 @@ With telecine (3:2 pulldown, interlaced 480i output):
 python main.py roundtrip input.mp4 -o output.mp4 --telecine
 ```
 
-### Encode video to composite signal
+#### Encode video to composite signal
 
 ```bash
 python main.py encode input.mp4 -o signal.npy
 ```
 
-### Decode composite signal to video
+#### Decode composite signal to video
 
 ```bash
 python main.py decode signal.npy -o output.mp4 --width 640 --height 480
 ```
 
-### Process a single image
+#### Process a single image
 
 ```bash
 python main.py image photo.png -o ntsc_photo.png
 ```
 
-### Generate SMPTE color bars
+#### Generate SMPTE color bars
 
 ```bash
-python main.py colorbars -o colorbars.npy --save-png bars.png
+python main.py colorbars -o colorbars.npy --save-source bars.png
 ```
 
-### Simulate weak signal reception
+#### Simulate weak signal reception
 
 ```bash
 # Subtle snow
@@ -80,6 +94,18 @@ python main.py image photo.png -o noisy.png --noise 0.05
 
 # Moderate degradation — all effects combined
 python main.py roundtrip input.mp4 -o degraded.mp4 --noise 0.05 --ghost 0.15 --attenuation 0.1 --jitter 0.5
+```
+
+### Rust
+
+The Rust version supports the same commands and flags. Replace `python main.py` with the compiled binary:
+
+```bash
+# From the rust/ directory after building:
+./target/release/ntsc-composite-simulator roundtrip input.mp4 -o output.mp4
+./target/release/ntsc-composite-simulator roundtrip input.mp4 -o output.mp4 --telecine
+./target/release/ntsc-composite-simulator image photo.png -o ntsc_photo.png
+./target/release/ntsc-composite-simulator colorbars -o colorbars.png --save-source source.png
 ```
 
 ### Options
@@ -99,11 +125,11 @@ python main.py roundtrip input.mp4 -o degraded.mp4 --noise 0.05 --ghost 0.15 --a
 | `--ghost-delay` | decode, roundtrip, image | Ghost delay in microseconds (default: 2.0) |
 | `--attenuation` | decode, roundtrip, image | Signal attenuation 0-1 (washed-out picture) |
 | `--jitter` | decode, roundtrip, image | Horizontal jitter in samples (timing instability) |
-| `--signal` | image | Also export the composite signal as `.npy` |
-| `--wav` | encode, image, colorbars | Export signal as a WAV file (stretched to 48 kHz for viewing in audio editors) |
-| `--save-png` | colorbars | Save the source SMPTE pattern as PNG |
+| `--signal` | image | Also export the composite signal as `.npy` (Python only) |
+| `--wav` | encode, image, colorbars | Export signal as a WAV file (Python only) |
+| `--save-source` | colorbars | Save the source SMPTE pattern as PNG |
 
-Run `python main.py <command> -h` for full details on any subcommand.
+Run `python main.py <command> -h` or `ntsc-composite-simulator <command> -h` for full details.
 
 ## How It Works
 
