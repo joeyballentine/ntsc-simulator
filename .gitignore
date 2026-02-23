@@ -12,6 +12,9 @@ build/
 .venv/
 venv/
 
+# Rust
+rust/target/
+
 # Allow example images
 !examples/
 !examples/*.png
