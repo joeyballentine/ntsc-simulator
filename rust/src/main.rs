@@ -111,14 +111,14 @@ fn cmd_image(input: &str, output: &str, width: Option<u32>, height: Option<u32>,
     eprintln!("Input: {} ({}x{})", input, w, h);
     eprintln!("Encoding to composite signal...");
 
-    let encoder = Encoder::new();
+    let mut encoder = Encoder::new();
     let t0 = Instant::now();
     let signal = encoder.encode_frame(pixels, w, h, 0);
     let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
     eprintln!("  Encode: {:.1} ms", encode_ms);
 
     eprintln!("Decoding from composite signal...");
-    let decoder = Decoder::new();
+    let mut decoder = Decoder::new();
     let t0 = Instant::now();
     let result_rgb = decoder.decode_frame(&signal, 0, out_w, out_h, comb_1h);
     let decode_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -220,9 +220,6 @@ fn cmd_roundtrip(
     let writer_stdin = writer.stdin.take().unwrap();
     let mut writer_buf = std::io::BufWriter::new(writer_stdin);
 
-    let encoder = Encoder::new();
-    let decoder = Decoder::new();
-
     let num_cpus = threads.unwrap_or_else(|| {
         std::thread::available_parallelism()
             .map(|n| n.get())
@@ -231,12 +228,10 @@ fn cmd_roundtrip(
     let batch_size = num_cpus;
     eprintln!("  Batch size: {} (parallel frames)", batch_size);
 
-    // Disable rayon's internal row-level parallelism — with frame-level
-    // parallelism we want one frame per thread for maximum throughput.
     rayon::ThreadPoolBuilder::new()
         .num_threads(num_cpus)
         .build_global()
-        .ok(); // ignore error if pool already initialized
+        .ok();
 
     let mut frame_num = 0u32;
     let total_start = Instant::now();
@@ -259,6 +254,14 @@ fn cmd_roundtrip(
         );
         pb
     };
+
+    // Thread-local encoder/decoder — each rayon thread gets its own with
+    // pre-allocated scratch buffers, avoiding cross-thread contention.
+    use std::cell::RefCell;
+    thread_local! {
+        static TL_ENCODER: RefCell<Encoder> = RefCell::new(Encoder::new());
+        static TL_DECODER: RefCell<Decoder> = RefCell::new(Decoder::new());
+    }
 
     loop {
         // Read a batch of frames
@@ -283,12 +286,17 @@ fn cmd_roundtrip(
 
         let batch_len = batch.len() as u32;
 
-        // Process all frames in the batch in parallel
+        // Process all frames in the batch in parallel, each thread
+        // uses its own encoder/decoder with reused scratch buffers
         let results: Vec<Vec<u8>> = batch
             .par_iter()
             .map(|(frame_buf, fnum)| {
-                let signal = encoder.encode_frame(frame_buf, in_w, in_h, *fnum);
-                decoder.decode_frame(&signal, *fnum, out_w, out_h, comb_1h)
+                TL_ENCODER.with(|enc| {
+                    TL_DECODER.with(|dec| {
+                        let signal = enc.borrow_mut().encode_frame(frame_buf, in_w, in_h, *fnum);
+                        dec.borrow_mut().decode_frame(&signal, *fnum, out_w, out_h, comb_1h)
+                    })
+                })
             })
             .collect();
 

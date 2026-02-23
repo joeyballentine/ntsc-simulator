@@ -1,12 +1,13 @@
 /// NTSC composite video encoder: RGB frames -> composite signal.
 
 use crate::constants::*;
-use crate::filters::{self, FilterKernel, NtscFilters};
+use crate::filters::{self, FilterKernel, FilterScratch, NtscFilters};
 
 const PAD: usize = NUM_TAPS;
 const PADDED_ACTIVE: usize = ACTIVE_SAMPLES + 2 * PAD;
 
 /// Precomputed data for the encoder (reuse across frames).
+/// Each thread should have its own Encoder to avoid contention on scratch buffers.
 pub struct Encoder {
     /// Filters for padded active region
     active_filters: NtscFilters,
@@ -16,90 +17,75 @@ pub struct Encoder {
     abs_lines: [usize; VISIBLE_LINES],
     /// Blank burst lines
     blank_burst_lines: Vec<usize>,
+    /// Reusable FFT scratch buffer (sized for PADDED_ACTIVE)
+    fft_scratch: FilterScratch,
+    // --- Pre-allocated working buffers ---
+    y_all: Vec<f32>,
+    i_all: Vec<f32>,
+    q_all: Vec<f32>,
+    padded_buf: Vec<f32>,
+    active_voltage: Vec<f32>,
 }
 
 impl Encoder {
     pub fn new() -> Self {
         let fir_y = filters::design_lowpass(LUMA_BW, NUM_TAPS);
+        let active_filters = NtscFilters::new(PADDED_ACTIVE);
+        let fft_n = active_filters.luma.fft_n();
 
         Self {
-            active_filters: NtscFilters::new(PADDED_ACTIVE),
             vsb_filter: FilterKernel::new(&fir_y, PADDED_ACTIVE),
+            active_filters,
             abs_lines: build_abs_lines(),
             blank_burst_lines: blank_burst_lines(),
+            fft_scratch: FilterScratch::new(fft_n),
+            y_all: vec![0.0f32; VISIBLE_LINES * ACTIVE_SAMPLES],
+            i_all: vec![0.0f32; VISIBLE_LINES * ACTIVE_SAMPLES],
+            q_all: vec![0.0f32; VISIBLE_LINES * ACTIVE_SAMPLES],
+            padded_buf: vec![0.0f32; VISIBLE_LINES * PADDED_ACTIVE],
+            active_voltage: vec![0.0f32; VISIBLE_LINES * ACTIVE_SAMPLES],
         }
     }
 
     /// Encode a single RGB frame to a composite NTSC signal.
-    ///
-    /// `frame_rgb` is row-major RGB u8 data, dimensions `height x width x 3`.
-    /// Returns a flat f32 signal of length TOTAL_LINES * SAMPLES_PER_LINE.
     pub fn encode_frame(
-        &self,
+        &mut self,
         frame_rgb: &[u8],
         width: usize,
         height: usize,
         frame_number: u32,
     ) -> Vec<f32> {
-        // 1. RGB -> YIQ
-        let (y_img, i_img, q_img) = rgb_to_yiq(frame_rgb, width, height);
+        // 1. RGB -> YIQ (directly into pre-allocated y/i/q planes via resampling)
+        let src_rows_f1 = build_visible_line_map(height, 0);
+        let src_rows_f2 = build_visible_line_map(height, 1);
 
-        // 2. Map visible lines to source rows
-        let src_rows_f1 = build_visible_line_map(height, 0); // even indices -> 240 rows
-        let src_rows_f2 = build_visible_line_map(height, 1); // odd indices -> 240 rows
+        // Resample and interleave fields directly into y_all/i_all/q_all
+        resample_yiq_interleaved(
+            frame_rgb,
+            width,
+            height,
+            &src_rows_f1,
+            &src_rows_f2,
+            &mut self.y_all,
+            &mut self.i_all,
+            &mut self.q_all,
+        );
 
-        // 3. Resample each field's rows to ACTIVE_SAMPLES
-        let y_f1 = resample_rows(&y_img, width, &src_rows_f1, ACTIVE_SAMPLES);
-        let i_f1 = resample_rows(&i_img, width, &src_rows_f1, ACTIVE_SAMPLES);
-        let q_f1 = resample_rows(&q_img, width, &src_rows_f1, ACTIVE_SAMPLES);
+        // 2. Bandwidth-limit: pad, filter, unpad for Y, I, Q
+        pad_edge_into(&self.y_all, VISIBLE_LINES, ACTIVE_SAMPLES, PAD, &mut self.padded_buf);
+        filters::filter_rows_sequential(&self.active_filters.luma, &mut self.padded_buf, PADDED_ACTIVE, &mut self.fft_scratch);
+        unpad_into(&self.padded_buf, VISIBLE_LINES, PADDED_ACTIVE, PAD, &mut self.y_all);
 
-        let y_f2 = resample_rows(&y_img, width, &src_rows_f2, ACTIVE_SAMPLES);
-        let i_f2 = resample_rows(&i_img, width, &src_rows_f2, ACTIVE_SAMPLES);
-        let q_f2 = resample_rows(&q_img, width, &src_rows_f2, ACTIVE_SAMPLES);
+        pad_edge_into(&self.i_all, VISIBLE_LINES, ACTIVE_SAMPLES, PAD, &mut self.padded_buf);
+        filters::filter_rows_sequential(&self.active_filters.i_channel, &mut self.padded_buf, PADDED_ACTIVE, &mut self.fft_scratch);
+        unpad_into(&self.padded_buf, VISIBLE_LINES, PADDED_ACTIVE, PAD, &mut self.i_all);
 
-        // 4. Interleave fields: visible line 0 from f1, 1 from f2, 2 from f1, ...
-        let mut y_all = vec![0.0f32; VISIBLE_LINES * ACTIVE_SAMPLES];
-        let mut i_all = vec![0.0f32; VISIBLE_LINES * ACTIVE_SAMPLES];
-        let mut q_all = vec![0.0f32; VISIBLE_LINES * ACTIVE_SAMPLES];
+        pad_edge_into(&self.q_all, VISIBLE_LINES, ACTIVE_SAMPLES, PAD, &mut self.padded_buf);
+        filters::filter_rows_sequential(&self.active_filters.q_channel, &mut self.padded_buf, PADDED_ACTIVE, &mut self.fft_scratch);
+        unpad_into(&self.padded_buf, VISIBLE_LINES, PADDED_ACTIVE, PAD, &mut self.q_all);
 
-        for row in 0..240 {
-            let even = row * 2;
-            let odd = row * 2 + 1;
-            y_all[even * ACTIVE_SAMPLES..(even + 1) * ACTIVE_SAMPLES]
-                .copy_from_slice(&y_f1[row * ACTIVE_SAMPLES..(row + 1) * ACTIVE_SAMPLES]);
-            y_all[odd * ACTIVE_SAMPLES..(odd + 1) * ACTIVE_SAMPLES]
-                .copy_from_slice(&y_f2[row * ACTIVE_SAMPLES..(row + 1) * ACTIVE_SAMPLES]);
-            i_all[even * ACTIVE_SAMPLES..(even + 1) * ACTIVE_SAMPLES]
-                .copy_from_slice(&i_f1[row * ACTIVE_SAMPLES..(row + 1) * ACTIVE_SAMPLES]);
-            i_all[odd * ACTIVE_SAMPLES..(odd + 1) * ACTIVE_SAMPLES]
-                .copy_from_slice(&i_f2[row * ACTIVE_SAMPLES..(row + 1) * ACTIVE_SAMPLES]);
-            q_all[even * ACTIVE_SAMPLES..(even + 1) * ACTIVE_SAMPLES]
-                .copy_from_slice(&q_f1[row * ACTIVE_SAMPLES..(row + 1) * ACTIVE_SAMPLES]);
-            q_all[odd * ACTIVE_SAMPLES..(odd + 1) * ACTIVE_SAMPLES]
-                .copy_from_slice(&q_f2[row * ACTIVE_SAMPLES..(row + 1) * ACTIVE_SAMPLES]);
-        }
-
-        // 5. Pad with edge values and bandwidth-limit
-        let mut y_padded = pad_edge_2d(&y_all, VISIBLE_LINES, ACTIVE_SAMPLES, PAD);
-        let mut i_padded = pad_edge_2d(&i_all, VISIBLE_LINES, ACTIVE_SAMPLES, PAD);
-        let mut q_padded = pad_edge_2d(&q_all, VISIBLE_LINES, ACTIVE_SAMPLES, PAD);
-
-        filters::filter_rows_sequential(&self.active_filters.luma, &mut y_padded, PADDED_ACTIVE);
-        filters::filter_rows_sequential(&self.active_filters.i_channel, &mut i_padded, PADDED_ACTIVE);
-        filters::filter_rows_sequential(&self.active_filters.q_channel, &mut q_padded, PADDED_ACTIVE);
-
-        // Unpad
-        unpad_2d(&y_padded, VISIBLE_LINES, PADDED_ACTIVE, PAD, &mut y_all);
-        unpad_2d(&i_padded, VISIBLE_LINES, PADDED_ACTIVE, PAD, &mut i_all);
-        unpad_2d(&q_padded, VISIBLE_LINES, PADDED_ACTIVE, PAD, &mut q_all);
-
-        // 6. Generate carriers and modulate chroma
+        // 3. Generate carriers using LUT and modulate chroma
         let frame_phase = std::f32::consts::PI * frame_number as f32;
-        let omega = std::f32::consts::PI / 2.0; // 2π * FSC / SAMPLE_RATE = π/2
-
-        // Build active_voltage = (Y + chroma) * COMPOSITE_SCALE + COMPOSITE_OFFSET
-        // Using carrier LUT optimization: cos(ω*n + φ) cycles through 4-element pattern
-        let mut active_voltage = vec![0.0f32; VISIBLE_LINES * ACTIVE_SAMPLES];
 
         for vis_line in 0..VISIBLE_LINES {
             let abs_line = if vis_line % 2 == 0 {
@@ -109,199 +95,227 @@ impl Encoder {
             };
             let line_phase = std::f32::consts::PI * abs_line as f32 + frame_phase;
 
-            let y_row = &y_all[vis_line * ACTIVE_SAMPLES..(vis_line + 1) * ACTIVE_SAMPLES];
-            let i_row = &i_all[vis_line * ACTIVE_SAMPLES..(vis_line + 1) * ACTIVE_SAMPLES];
-            let q_row = &q_all[vis_line * ACTIVE_SAMPLES..(vis_line + 1) * ACTIVE_SAMPLES];
-            let row = &mut active_voltage[vis_line * ACTIVE_SAMPLES..(vis_line + 1) * ACTIVE_SAMPLES];
+            // Carrier LUT: since ω = π/2, cos(π/2·n + φ) cycles every 4 samples:
+            //   n%4==0: cos(φ), n%4==1: -sin(φ), n%4==2: -cos(φ), n%4==3: sin(φ)
+            // For I carrier: φ = line_phase + I_PHASE_RAD at sample index ACTIVE_START
+            let i_phi = (std::f32::consts::FRAC_PI_2) * ACTIVE_START as f32 + line_phase + I_PHASE_RAD;
+            let q_phi = (std::f32::consts::FRAC_PI_2) * ACTIVE_START as f32 + line_phase + Q_PHASE_RAD;
+
+            let i_cos = i_phi.cos();
+            let i_sin = i_phi.sin();
+            let q_cos = q_phi.cos();
+            let q_sin = q_phi.sin();
+
+            // LUT for carrier values at n%4 offsets from ACTIVE_START
+            let i_lut = [i_cos, -i_sin, -i_cos, i_sin];
+            let q_lut = [q_cos, -q_sin, -q_cos, q_sin];
+
+            let base = vis_line * ACTIVE_SAMPLES;
+            let y_row = &self.y_all[base..base + ACTIVE_SAMPLES];
+            let i_row = &self.i_all[base..base + ACTIVE_SAMPLES];
+            let q_row = &self.q_all[base..base + ACTIVE_SAMPLES];
+            let row = &mut self.active_voltage[base..base + ACTIVE_SAMPLES];
 
             for n in 0..ACTIVE_SAMPLES {
-                let sample_idx = ACTIVE_START + n;
-                let phase = omega * sample_idx as f32 + line_phase;
-                let i_carrier = (phase + I_PHASE_RAD).cos();
-                let q_carrier = (phase + Q_PHASE_RAD).cos();
+                let i_carrier = i_lut[n & 3];
+                let q_carrier = q_lut[n & 3];
                 let chroma = i_row[n] * i_carrier + q_row[n] * q_carrier;
                 row[n] = (y_row[n] + chroma) * COMPOSITE_SCALE + COMPOSITE_OFFSET;
             }
         }
 
-        // 7. VSB filter: 4.2 MHz lowpass on composite
-        let mut av_padded = pad_edge_2d(&active_voltage, VISIBLE_LINES, ACTIVE_SAMPLES, PAD);
-        filters::filter_rows_sequential(&self.vsb_filter, &mut av_padded, PADDED_ACTIVE);
-        unpad_2d(
-            &av_padded,
-            VISIBLE_LINES,
-            PADDED_ACTIVE,
-            PAD,
-            &mut active_voltage,
-        );
+        // 4. VSB filter: 4.2 MHz lowpass on composite
+        pad_edge_into(&self.active_voltage, VISIBLE_LINES, ACTIVE_SAMPLES, PAD, &mut self.padded_buf);
+        filters::filter_rows_sequential(&self.vsb_filter, &mut self.padded_buf, PADDED_ACTIVE, &mut self.fft_scratch);
+        unpad_into(&self.padded_buf, VISIBLE_LINES, PADDED_ACTIVE, PAD, &mut self.active_voltage);
 
-        // 8. Build the full 525-line signal
+        // 5. Build the full 525-line signal
         let mut signal = vec![BLANKING_V; TOTAL_LINES * SAMPLES_PER_LINE];
 
-        // Write blanking structure
         write_blanking_structure(&mut signal);
-
-        // Write colorburst for all visible lines
         self.write_burst_visible(&mut signal, frame_phase);
 
-        // Write active video into the correct lines
         for vis_line in 0..VISIBLE_LINES {
             let abs_line = self.abs_lines[vis_line];
             let sig_start = abs_line * SAMPLES_PER_LINE + ACTIVE_START;
             let av_start = vis_line * ACTIVE_SAMPLES;
             signal[sig_start..sig_start + ACTIVE_SAMPLES]
-                .copy_from_slice(&active_voltage[av_start..av_start + ACTIVE_SAMPLES]);
+                .copy_from_slice(&self.active_voltage[av_start..av_start + ACTIVE_SAMPLES]);
         }
 
-        // Write burst on blank lines
         self.write_burst_blank_lines(&mut signal, frame_phase);
 
         signal
     }
 
     fn write_burst_visible(&self, signal: &mut [f32], frame_phase: f32) {
-        let omega = std::f32::consts::PI / 2.0;
         for vis_line in 0..VISIBLE_LINES {
             let abs_line = self.abs_lines[vis_line];
             let line_phase = std::f32::consts::PI * abs_line as f32 + frame_phase;
-            let sig_base = abs_line * SAMPLES_PER_LINE;
-            for n in 0..BURST_SAMPLES {
-                let sample_idx = BURST_START + n;
-                let phase = omega * sample_idx as f32 + line_phase;
-                signal[sig_base + sample_idx] = BLANKING_V + (-phase.cos()) * BURST_V;
-            }
+            write_burst_line(signal, abs_line, line_phase);
         }
     }
 
     fn write_burst_blank_lines(&self, signal: &mut [f32], frame_phase: f32) {
-        let omega = std::f32::consts::PI / 2.0;
         for &ln in &self.blank_burst_lines {
             let line_phase = std::f32::consts::PI * ln as f32 + frame_phase;
-            let sig_base = ln * SAMPLES_PER_LINE;
-            for n in 0..BURST_SAMPLES {
-                let sample_idx = BURST_START + n;
-                let phase = omega * sample_idx as f32 + line_phase;
-                signal[sig_base + sample_idx] = BLANKING_V + (-phase.cos()) * BURST_V;
-            }
+            write_burst_line(signal, ln, line_phase);
         }
     }
 }
 
-/// Convert RGB u8 frame to separate Y, I, Q float32 planes.
-fn rgb_to_yiq(frame: &[u8], width: usize, height: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
-    let pixels = width * height;
-    let mut y = vec![0.0f32; pixels];
-    let mut i = vec![0.0f32; pixels];
-    let mut q = vec![0.0f32; pixels];
+/// Write colorburst on a single line using the carrier LUT.
+fn write_burst_line(signal: &mut [f32], line_num: usize, line_phase: f32) {
+    // Burst carrier is -cos(ω*n + line_phase) where ω = π/2
+    // Phase at BURST_START: φ = π/2 * BURST_START + line_phase
+    let phi = std::f32::consts::FRAC_PI_2 * BURST_START as f32 + line_phase;
+    let cos_phi = phi.cos();
+    let sin_phi = phi.sin();
+    // -cos(φ + π/2·k) for k=0..3: [-cos(φ), sin(φ), cos(φ), -sin(φ)]
+    let lut = [-cos_phi, sin_phi, cos_phi, -sin_phi];
 
-    for p in 0..pixels {
-        let r = frame[p * 3] as f32 / 255.0;
-        let g = frame[p * 3 + 1] as f32 / 255.0;
-        let b = frame[p * 3 + 2] as f32 / 255.0;
+    let sig_base = line_num * SAMPLES_PER_LINE + BURST_START;
+    for n in 0..BURST_SAMPLES {
+        signal[sig_base + n] = BLANKING_V + lut[n & 3] * BURST_V;
+    }
+}
 
-        y[p] = RGB_TO_YIQ[0][0] * r + RGB_TO_YIQ[0][1] * g + RGB_TO_YIQ[0][2] * b;
-        i[p] = RGB_TO_YIQ[1][0] * r + RGB_TO_YIQ[1][1] * g + RGB_TO_YIQ[1][2] * b;
-        q[p] = RGB_TO_YIQ[2][0] * r + RGB_TO_YIQ[2][1] * g + RGB_TO_YIQ[2][2] * b;
+/// RGB to YIQ conversion + resampling + field interleaving in one pass.
+/// Writes directly into pre-allocated y/i/q buffers (VISIBLE_LINES x ACTIVE_SAMPLES).
+fn resample_yiq_interleaved(
+    frame_rgb: &[u8],
+    width: usize,
+    _height: usize,
+    src_rows_f1: &[usize],
+    src_rows_f2: &[usize],
+    y_all: &mut [f32],
+    i_all: &mut [f32],
+    q_all: &mut [f32],
+) {
+    // Precompute interpolation indices for resampling width -> ACTIVE_SAMPLES
+    let scale = if width == ACTIVE_SAMPLES {
+        0.0 // unused
+    } else {
+        (width - 1) as f32 / (ACTIVE_SAMPLES - 1) as f32
+    };
+
+    let mut x0s = vec![0usize; ACTIVE_SAMPLES];
+    let mut x1s = vec![0usize; ACTIVE_SAMPLES];
+    let mut ts = vec![0.0f32; ACTIVE_SAMPLES];
+
+    if width != ACTIVE_SAMPLES {
+        for j in 0..ACTIVE_SAMPLES {
+            let x = j as f32 * scale;
+            let x0 = (x as usize).min(width - 1);
+            x0s[j] = x0;
+            x1s[j] = (x0 + 1).min(width - 1);
+            ts[j] = x - x0 as f32;
+        }
     }
 
-    (y, i, q)
+    // Process both fields, interleaved
+    for field_row in 0..240 {
+        // Field 1 (even visible lines)
+        let vis_even = field_row * 2;
+        let src_row = src_rows_f1[field_row];
+        write_yiq_row(frame_rgb, width, src_row, y_all, i_all, q_all, vis_even, &x0s, &x1s, &ts);
+
+        // Field 2 (odd visible lines)
+        let vis_odd = field_row * 2 + 1;
+        let src_row = src_rows_f2[field_row];
+        write_yiq_row(frame_rgb, width, src_row, y_all, i_all, q_all, vis_odd, &x0s, &x1s, &ts);
+    }
+}
+
+/// Convert one source row to YIQ and resample to ACTIVE_SAMPLES, writing into the given visible line.
+#[inline]
+fn write_yiq_row(
+    frame_rgb: &[u8],
+    width: usize,
+    src_row: usize,
+    y_all: &mut [f32],
+    i_all: &mut [f32],
+    q_all: &mut [f32],
+    vis_line: usize,
+    x0s: &[usize],
+    x1s: &[usize],
+    ts: &[f32],
+) {
+    let row_base = src_row * width * 3;
+    let out_base = vis_line * ACTIVE_SAMPLES;
+
+    if width == ACTIVE_SAMPLES {
+        // No resampling needed
+        for j in 0..ACTIVE_SAMPLES {
+            let px = row_base + j * 3;
+            let r = frame_rgb[px] as f32 * (1.0 / 255.0);
+            let g = frame_rgb[px + 1] as f32 * (1.0 / 255.0);
+            let b = frame_rgb[px + 2] as f32 * (1.0 / 255.0);
+            y_all[out_base + j] = RGB_TO_YIQ[0][0] * r + RGB_TO_YIQ[0][1] * g + RGB_TO_YIQ[0][2] * b;
+            i_all[out_base + j] = RGB_TO_YIQ[1][0] * r + RGB_TO_YIQ[1][1] * g + RGB_TO_YIQ[1][2] * b;
+            q_all[out_base + j] = RGB_TO_YIQ[2][0] * r + RGB_TO_YIQ[2][1] * g + RGB_TO_YIQ[2][2] * b;
+        }
+    } else {
+        // Resample with linear interpolation, fused with RGB->YIQ
+        for j in 0..ACTIVE_SAMPLES {
+            let px0 = row_base + x0s[j] * 3;
+            let px1 = row_base + x1s[j] * 3;
+            let t = ts[j];
+            let t_inv = 1.0 - t;
+
+            let r = frame_rgb[px0] as f32 * t_inv + frame_rgb[px1] as f32 * t;
+            let g = frame_rgb[px0 + 1] as f32 * t_inv + frame_rgb[px1 + 1] as f32 * t;
+            let b = frame_rgb[px0 + 2] as f32 * t_inv + frame_rgb[px1 + 2] as f32 * t;
+
+            let r = r * (1.0 / 255.0);
+            let g = g * (1.0 / 255.0);
+            let b = b * (1.0 / 255.0);
+
+            y_all[out_base + j] = RGB_TO_YIQ[0][0] * r + RGB_TO_YIQ[0][1] * g + RGB_TO_YIQ[0][2] * b;
+            i_all[out_base + j] = RGB_TO_YIQ[1][0] * r + RGB_TO_YIQ[1][1] * g + RGB_TO_YIQ[1][2] * b;
+            q_all[out_base + j] = RGB_TO_YIQ[2][0] * r + RGB_TO_YIQ[2][1] * g + RGB_TO_YIQ[2][2] * b;
+        }
+    }
 }
 
 /// Build mapping from field visible lines to source rows.
-/// `field`: 0 = even (field 1), 1 = odd (field 2)
-/// Returns 240 source row indices.
 fn build_visible_line_map(src_height: usize, field: usize) -> Vec<usize> {
-    let mut rows = Vec::with_capacity(240);
-    for idx in 0..240 {
-        let vis = idx * 2 + field;
-        let src_row = (vis * src_height / VISIBLE_LINES).min(src_height - 1);
-        rows.push(src_row);
-    }
-    rows
+    (0..240)
+        .map(|idx| {
+            let vis = idx * 2 + field;
+            (vis * src_height / VISIBLE_LINES).min(src_height - 1)
+        })
+        .collect()
 }
 
-/// Resample rows via linear interpolation from `src_width` to `target_width`.
-/// `src_rows` contains the source row indices to extract.
-fn resample_rows(
-    plane: &[f32],
-    src_width: usize,
-    src_rows: &[usize],
-    target_width: usize,
-) -> Vec<f32> {
-    let num_rows = src_rows.len();
-    let mut out = vec![0.0f32; num_rows * target_width];
-
-    if src_width == target_width {
-        for (i, &row) in src_rows.iter().enumerate() {
-            let src_start = row * src_width;
-            out[i * target_width..(i + 1) * target_width]
-                .copy_from_slice(&plane[src_start..src_start + src_width]);
-        }
-        return out;
-    }
-
-    // Precompute interpolation indices and weights
-    let scale = (src_width - 1) as f32 / (target_width - 1) as f32;
-    let mut x0s = vec![0usize; target_width];
-    let mut x1s = vec![0usize; target_width];
-    let mut ts = vec![0.0f32; target_width];
-
-    for j in 0..target_width {
-        let x = j as f32 * scale;
-        let x0 = (x as usize).min(src_width - 1);
-        let x1 = (x0 + 1).min(src_width - 1);
-        x0s[j] = x0;
-        x1s[j] = x1;
-        ts[j] = x - x0 as f32;
-    }
-
-    for (i, &row) in src_rows.iter().enumerate() {
-        let src_base = row * src_width;
-        let out_base = i * target_width;
-        for j in 0..target_width {
-            let v0 = plane[src_base + x0s[j]];
-            let v1 = plane[src_base + x1s[j]];
-            out[out_base + j] = v0 + (v1 - v0) * ts[j];
-        }
-    }
-
-    out
-}
-
-/// Pad each row with edge values on left and right.
-fn pad_edge_2d(
+/// Pad each row with edge values, writing into a pre-allocated output buffer.
+fn pad_edge_into(
     data: &[f32],
     num_rows: usize,
     row_len: usize,
     pad: usize,
-) -> Vec<f32> {
+    out: &mut [f32],
+) {
     let padded_len = row_len + 2 * pad;
-    let mut out = vec![0.0f32; num_rows * padded_len];
-
     for r in 0..num_rows {
         let src_start = r * row_len;
         let dst_start = r * padded_len;
         let left_val = data[src_start];
         let right_val = data[src_start + row_len - 1];
 
-        // Left pad
         for j in 0..pad {
             out[dst_start + j] = left_val;
         }
-        // Copy data
         out[dst_start + pad..dst_start + pad + row_len]
             .copy_from_slice(&data[src_start..src_start + row_len]);
-        // Right pad
         for j in 0..pad {
             out[dst_start + pad + row_len + j] = right_val;
         }
     }
-
-    out
 }
 
-/// Extract unpadded data from padded 2D array.
-fn unpad_2d(
+/// Extract unpadded data from padded 2D array into a pre-allocated output buffer.
+fn unpad_into(
     padded: &[f32],
     num_rows: usize,
     padded_row_len: usize,
@@ -333,7 +347,6 @@ fn write_blanking_structure(signal: &mut [f32]) {
         }
     }
 
-    // Helper closures
     let write_eq = |signal: &mut [f32], ln: usize, pos: usize| {
         let base = ln * SAMPLES_PER_LINE + pos;
         let end = (base + EQ_PULSE_SAMPLES).min((ln + 1) * SAMPLES_PER_LINE);
@@ -357,29 +370,22 @@ fn write_blanking_structure(signal: &mut [f32]) {
         }
     };
 
-    // Field 1 (lines 0-8)
-    // Pre-eq pulses: lines 0-2
     for ln in 0..3 {
         fill_blanking(signal, ln);
         write_eq(signal, ln, 0);
         write_eq(signal, ln, hl);
     }
-
-    // Vsync broad pulses: lines 3-5
     for ln in 3..6 {
         fill_blanking(signal, ln);
         write_broad(signal, ln, 0);
         write_broad(signal, ln, hl);
     }
-
-    // Post-eq pulses: lines 6-8
     for ln in 6..9 {
         fill_blanking(signal, ln);
         write_eq(signal, ln, 0);
         write_eq(signal, ln, hl);
     }
 
-    // Field 2 (lines 262-270)
     fill_blanking(signal, 262);
     write_eq(signal, 262, hl);
 
@@ -389,29 +395,24 @@ fn write_blanking_structure(signal: &mut [f32]) {
         write_eq(signal, ln, hl);
     }
 
-    // Line 265: EQ->Vsync transition
     fill_blanking(signal, 265);
     write_eq(signal, 265, 0);
     write_broad(signal, 265, hl);
 
-    // Lines 266-267: broad pulses
     for ln in 266..268 {
         fill_blanking(signal, ln);
         write_broad(signal, ln, 0);
         write_broad(signal, ln, hl);
     }
 
-    // Line 268: Vsync->Post-eq transition
     fill_blanking(signal, 268);
     write_broad(signal, 268, 0);
     write_eq(signal, 268, hl);
 
-    // Line 269: EQ pulses
     fill_blanking(signal, 269);
     write_eq(signal, 269, 0);
     write_eq(signal, 269, hl);
 
-    // Line 270: EQ at 0 only
     fill_blanking(signal, 270);
     write_eq(signal, 270, 0);
 }

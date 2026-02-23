@@ -5,7 +5,7 @@ edition = "2021"
 description = "NTSC composite video simulator — encode and decode RGB frames through a simulated NTSC signal path"
 
 [dependencies]
-rustfft = "6"
+realfft = "3"
 rayon = "1"
 clap = { version = "4", features = ["derive"] }
 image = "0.25"
