@@ -48,7 +48,7 @@ pub struct FilterKernel {
 impl FilterKernel {
     /// Create a precomputed filter kernel for signals of length `signal_len`.
     pub fn new(coeffs: &[f32], signal_len: usize) -> Self {
-        let fft_n = (signal_len + coeffs.len() - 1).next_power_of_two();
+        let fft_n = (signal_len + 2 * (coeffs.len() - 1)).next_power_of_two();
         let freq_bins = fft_n / 2 + 1;
 
         // R2C FFT of filter coefficients

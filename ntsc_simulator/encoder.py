@@ -85,7 +85,7 @@ def _fft_filtfilt_2d(coeffs, data_2d):
     yields zero phase shift and squared magnitude response |H(f)|^2.
     """
     n_cols = data_2d.shape[1]
-    fft_n = next_fast_len(n_cols + len(coeffs) - 1)
+    fft_n = next_fast_len(n_cols + 2 * len(coeffs) - 2)
     H = rfft(coeffs, n=fft_n)
     H2 = (H * np.conj(H)).real  # |H(f)|^2 — real-valued
     X = rfft(data_2d, n=fft_n, axis=1)

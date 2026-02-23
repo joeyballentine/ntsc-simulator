@@ -61,7 +61,7 @@ def _fft_filtfilt_2d(coeffs, data_2d):
     yields zero phase shift and squared magnitude response |H(f)|^2.
     """
     n_cols = data_2d.shape[1]
-    fft_n = next_fast_len(n_cols + len(coeffs) - 1)
+    fft_n = next_fast_len(n_cols + 2 * len(coeffs) - 2)
     H = rfft(coeffs, n=fft_n)
     H2 = (H * np.conj(H)).real  # |H(f)|^2 — real-valued
     X = rfft(data_2d, n=fft_n, axis=1)
@@ -112,8 +112,11 @@ def decode_frame(signal, frame_number=0, output_width=640, output_height=480,
         y_full = (full_lines + delayed) * _F(0.5)
         chroma_full = (full_lines - delayed) * _F(0.5)
 
-    # Lowpass luma at 4.2 MHz to remove residual subcarrier energy
-    y_full = _fft_filtfilt_2d(_FIR_Y, y_full)
+    # Lowpass luma at 4.2 MHz to remove residual subcarrier energy.
+    # Pad right side with edge values so the filter settles before the
+    # active region boundary (mirrors the I/Q padding approach below).
+    y_pad = np.pad(y_full, ((0, 0), (0, _RIGHT_PAD)), mode='edge')
+    y_full = _fft_filtfilt_2d(_FIR_Y, y_pad)[:, :SAMPLES_PER_LINE]
 
     # Undo composite voltage scaling on luma
     y_full = (y_full - _COMP_OFFSET) / _COMP_SCALE

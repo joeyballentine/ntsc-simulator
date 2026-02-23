@@ -45,7 +45,7 @@ impl Decoder {
 
         let iq_padded_len = SAMPLES_PER_LINE + RIGHT_PAD;
 
-        let luma_filter = FilterKernel::new(&fir_y, SAMPLES_PER_LINE);
+        let luma_filter = FilterKernel::new(&fir_y, SAMPLES_PER_LINE + RIGHT_PAD);
         let i_filter = FilterKernel::new(&fir_i, iq_padded_len);
 
         let luma_fft_n = luma_filter.fft_n();
@@ -60,7 +60,7 @@ impl Decoder {
             luma_scratch: FilterScratch::with_planner(&mut planner, luma_fft_n),
             iq_scratch: FilterScratch::with_planner(&mut planner, iq_fft_n),
             full_lines: vec![0.0f32; VISIBLE_LINES * SAMPLES_PER_LINE],
-            y_full: vec![0.0f32; VISIBLE_LINES * SAMPLES_PER_LINE],
+            y_full: vec![0.0f32; VISIBLE_LINES * (SAMPLES_PER_LINE + RIGHT_PAD)],
             chroma_full: vec![0.0f32; VISIBLE_LINES * SAMPLES_PER_LINE],
             burst_phases: vec![0.0f32; VISIBLE_LINES],
             i_raw: vec![0.0f32; VISIBLE_LINES * iq_padded_len],
@@ -80,6 +80,7 @@ impl Decoder {
         comb_1h: bool,
     ) -> &[u8] {
         let spl = SAMPLES_PER_LINE;
+        let ypl = spl + RIGHT_PAD;
 
         // Ensure output buffer is the right size
         let out_size = output_width * output_height * 3;
@@ -103,35 +104,44 @@ impl Decoder {
                 let ref_line = self.ref_lines[vis];
                 let ref_start = ref_line * spl;
                 let cur_start = vis * spl;
+                let y_start = vis * ypl;
                 for n in 0..spl {
                     let cur = self.full_lines[cur_start + n];
                     let ref_val = signal[ref_start + n];
-                    self.y_full[cur_start + n] = (cur + ref_val) * 0.5;
+                    self.y_full[y_start + n] = (cur + ref_val) * 0.5;
                     self.chroma_full[cur_start + n] = (cur - ref_val) * 0.5;
                 }
             }
         } else {
             for vis in 0..VISIBLE_LINES {
                 let base = vis * spl;
-                self.y_full[base] = self.full_lines[base] * 0.5;
-                self.y_full[base + 1] = self.full_lines[base + 1] * 0.5;
+                let ybase = vis * ypl;
+                self.y_full[ybase] = self.full_lines[base] * 0.5;
+                self.y_full[ybase + 1] = self.full_lines[base + 1] * 0.5;
                 self.chroma_full[base] = self.full_lines[base] * 0.5;
                 self.chroma_full[base + 1] = self.full_lines[base + 1] * 0.5;
 
                 for n in 2..spl {
                     let cur = self.full_lines[base + n];
                     let delayed = self.full_lines[base + n - 2];
-                    self.y_full[base + n] = (cur + delayed) * 0.5;
+                    self.y_full[ybase + n] = (cur + delayed) * 0.5;
                     self.chroma_full[base + n] = (cur - delayed) * 0.5;
                 }
             }
+        }
+
+        // Edge-pad luma rows on the right for filter settling
+        for vis in 0..VISIBLE_LINES {
+            let ybase = vis * ypl;
+            let right_val = self.y_full[ybase + spl - 1];
+            self.y_full[ybase + spl..ybase + ypl].fill(right_val);
         }
 
         // Lowpass luma at 4.2 MHz
         filters::filter_rows_sequential(
             &self.luma_filter,
             &mut self.y_full,
-            spl,
+            ypl,
             &mut self.luma_scratch,
         );
 
@@ -224,7 +234,7 @@ impl Decoder {
 
         if !need_resize {
             for vis in 0..VISIBLE_LINES {
-                let y_base = vis * spl + ACTIVE_START;
+                let y_base = vis * ypl + ACTIVE_START;
                 let iq_base = vis * iq_padded_len + ACTIVE_START;
                 let out_base = vis * ACTIVE_SAMPLES * 3;
 
@@ -276,10 +286,10 @@ impl Decoder {
                     let w10 = xt_inv * yt;
                     let w11 = xt * yt;
 
-                    let y = self.y_full[sy0 * spl + ACTIVE_START + sx0] * w00
-                        + self.y_full[sy0 * spl + ACTIVE_START + sx1] * w01
-                        + self.y_full[sy1 * spl + ACTIVE_START + sx0] * w10
-                        + self.y_full[sy1 * spl + ACTIVE_START + sx1] * w11;
+                    let y = self.y_full[sy0 * ypl + ACTIVE_START + sx0] * w00
+                        + self.y_full[sy0 * ypl + ACTIVE_START + sx1] * w01
+                        + self.y_full[sy1 * ypl + ACTIVE_START + sx0] * w10
+                        + self.y_full[sy1 * ypl + ACTIVE_START + sx1] * w11;
 
                     let i = (self.i_raw[sy0 * iq_padded_len + ACTIVE_START + sx0] * w00
                         + self.i_raw[sy0 * iq_padded_len + ACTIVE_START + sx1] * w01
