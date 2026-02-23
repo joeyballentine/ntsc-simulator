@@ -25,6 +25,37 @@ _STANDARD_RATES = [
 ]
 
 
+# File extensions recognised as processable media.
+_VIDEO_EXTENSIONS = {
+    '.mp4', '.mkv', '.mov', '.avi', '.wmv', '.flv',
+    '.webm', '.m4v', '.ts', '.mts', '.m2ts', '.mpg', '.mpeg',
+}
+_IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif', '.webp'}
+_SIGNAL_EXTENSIONS = {'.npy'}
+
+
+def _iter_files(folder, extensions):
+    """Yield absolute paths of files in *folder* whose suffix is in *extensions*.
+
+    Files are yielded in sorted order.  Sub-directories are ignored.
+    """
+    for entry in sorted(os.scandir(folder), key=lambda e: e.name.lower()):
+        if entry.is_file() and os.path.splitext(entry.name)[1].lower() in extensions:
+            yield entry.path
+
+
+def _batch_output_path(output_dir, input_path, new_ext=None):
+    """Return an output path under *output_dir* that mirrors the input filename.
+
+    If *new_ext* is given (e.g. '.npy') the extension is replaced; otherwise
+    the original extension is kept (container-matching behaviour).
+    """
+    name = os.path.basename(input_path)
+    if new_ext is not None:
+        name = os.path.splitext(name)[0] + new_ext
+    return os.path.join(output_dir, name)
+
+
 def _fps_to_rational(fps):
     """Return an ffmpeg-compatible rational string for *fps*.
 
@@ -181,13 +212,13 @@ def _read_frame_rgb(cap):
     return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
 
-def cmd_encode(args):
-    """Encode a video file to a composite NTSC signal (.npy)."""
+def _encode_one(input_path, output_path, wav_path=None):
+    """Encode a single video file to a composite NTSC signal."""
     from ntsc_simulator.encoder import encode_frame
     from ntsc_simulator.signal_io import export_signal, export_wav
 
-    cap, total_frames, _ = _read_input(args.input)
-    print(f"Encoding {args.input} ({total_frames} frames) to composite signal...")
+    cap, total_frames, _ = _read_input(input_path)
+    print(f"Encoding {input_path} ({total_frames} frames) to composite signal...")
 
     all_signals = []
     frame_num = 0
@@ -202,18 +233,38 @@ def cmd_encode(args):
     cap.release()
 
     if not all_signals:
-        print("Error: No frames read from video")
-        sys.exit(1)
+        print(f"Warning: No frames read from '{input_path}', skipping.")
+        return
 
     full_signal = np.concatenate(all_signals)
     print(f"Exporting signal ({len(full_signal)} samples, "
           f"{len(full_signal) / 14318180:.2f}s)...")
-    export_signal(full_signal, args.output)
-    print(f"Done: {args.output}")
+    export_signal(full_signal, output_path)
+    print(f"Done: {output_path}")
 
-    if args.wav:
-        export_wav(full_signal, args.wav)
-        print(f"WAV: {args.wav}")
+    if wav_path:
+        export_wav(full_signal, wav_path)
+        print(f"WAV: {wav_path}")
+
+
+def cmd_encode(args):
+    """Encode a video file (or folder of videos) to composite NTSC signal(s)."""
+    if os.path.isdir(args.input):
+        files = list(_iter_files(args.input, _VIDEO_EXTENSIONS))
+        if not files:
+            print(f"No video files found in '{args.input}'")
+            sys.exit(1)
+        os.makedirs(args.output, exist_ok=True)
+        print(f"Batch encode: {len(files)} file(s) -> '{args.output}'")
+        for path in files:
+            out_path = _batch_output_path(args.output, path, new_ext='.npy')
+            wav_path = None
+            if args.wav:
+                os.makedirs(args.wav, exist_ok=True)
+                wav_path = _batch_output_path(args.wav, path, new_ext='.wav')
+            _encode_one(path, out_path, wav_path)
+    else:
+        _encode_one(args.input, args.output, args.wav)
 
 
 def _build_pipeline(args):
@@ -258,14 +309,14 @@ def _build_effects_dict(args):
     return effects
 
 
-def cmd_decode(args):
-    """Decode a composite NTSC signal (.npy) back to video."""
+def _decode_one(input_path, output_path, args):
+    """Decode a single .npy composite signal file to video."""
     from ntsc_simulator.decoder import decode_frame
     from ntsc_simulator.signal_io import import_signal
     from ntsc_simulator.constants import TOTAL_LINES, SAMPLES_PER_LINE
 
-    print(f"Importing signal from {args.input}...")
-    signal, sample_rate = import_signal(args.input)
+    print(f"Importing signal from {input_path}...")
+    signal, sample_rate = import_signal(input_path)
     print(f"  {len(signal)} samples at {sample_rate} Hz")
 
     samples_per_frame = TOTAL_LINES * SAMPLES_PER_LINE
@@ -279,7 +330,7 @@ def cmd_decode(args):
 
     width = args.width
     height = args.height
-    out = _make_writer(args.output, width, height,
+    out = _make_writer(output_path, width, height,
                        crf=args.crf, preset=args.preset)
 
     comb_1h = getattr(args, 'comb_1h', False)
@@ -291,7 +342,27 @@ def cmd_decode(args):
         out.write(frame_rgb)
 
     out.release()
-    print(f"Done: {args.output}")
+    print(f"Done: {output_path}")
+
+
+def cmd_decode(args):
+    """Decode a composite NTSC signal (.npy), or a folder of them, back to video."""
+    if os.path.isdir(args.input):
+        files = list(_iter_files(args.input, _SIGNAL_EXTENSIONS))
+        if not files:
+            print(f"No .npy signal files found in '{args.input}'")
+            sys.exit(1)
+        os.makedirs(args.output, exist_ok=True)
+        # Determine per-file output extension: honour --ext if given, else .mp4
+        out_ext = getattr(args, 'ext', None) or '.mp4'
+        if not out_ext.startswith('.'):
+            out_ext = '.' + out_ext
+        print(f"Batch decode: {len(files)} file(s) -> '{args.output}' (ext: {out_ext})")
+        for path in files:
+            out_path = _batch_output_path(args.output, path, new_ext=out_ext)
+            _decode_one(path, out_path, args)
+    else:
+        _decode_one(args.input, args.output, args)
 
 
 def _ntsc_worker(args):
@@ -382,44 +453,56 @@ def _get_num_workers(override=None):
     return max(1, os.cpu_count() - 1)
 
 
-def cmd_roundtrip(args):
-    """Encode video to composite signal and decode back."""
-    cap, total_frames, input_fps = _read_input(args.input)
+def _roundtrip_one(input_path, output_path, args, workers):
+    """Run a single-file roundtrip (progressive or telecine)."""
+    cap, total_frames, input_fps = _read_input(input_path)
     width = args.width
     height = args.height
-    workers = _get_num_workers(args.threads)
-
     comb_1h = getattr(args, 'comb_1h', False)
-
     crf = args.crf
     preset = args.preset
-
-    # Build effects dict (plain data, safe for multiprocessing pickling)
     effects = _build_effects_dict(args)
-    if effects:
-        print(f"  Signal effects: {', '.join(effects.keys())}")
 
     if args.telecine:
-        # Telecine always outputs 29.97fps interlaced (4 film frames -> 5 NTSC frames)
-        out = _make_writer(args.output, width, height, fps=29.97, interlaced=True,
+        out = _make_writer(output_path, width, height, fps=29.97, interlaced=True,
                            crf=crf, preset=preset)
-        print(f"Roundtrip (3:2 telecine 480i): {args.input} -> composite -> {args.output}")
+        print(f"Roundtrip (3:2 telecine 480i): {input_path} -> composite -> {output_path}")
         print(f"  Input: {input_fps:.3f}fps, Output: {width}x{height} 29.97fps interlaced (TFF), {workers} workers")
         _roundtrip_telecine(cap, out, width, height, total_frames, workers,
                             comb_1h, effects)
     else:
-        out = _make_writer(args.output, width, height, fps=input_fps, interlaced=False,
+        out = _make_writer(output_path, width, height, fps=input_fps, interlaced=False,
                            crf=crf, preset=preset)
-        print(f"Roundtrip (progressive): {args.input} -> composite -> {args.output}")
+        print(f"Roundtrip (progressive): {input_path} -> composite -> {output_path}")
         print(f"  Output: {width}x{height} {input_fps:.3f}fps progressive, {workers} workers")
         _roundtrip_progressive(cap, out, width, height, total_frames, workers,
                                comb_1h, effects)
 
     cap.release()
     out.release()
+    _mux_audio(input_path, output_path)
 
-    # Mux audio from source into output
-    _mux_audio(args.input, args.output)
+
+def cmd_roundtrip(args):
+    """Encode video (or folder of videos) to composite signal and decode back."""
+    workers = _get_num_workers(args.threads)
+    effects = _build_effects_dict(args)
+    if effects:
+        print(f"  Signal effects: {', '.join(effects.keys())}")
+
+    if os.path.isdir(args.input):
+        files = list(_iter_files(args.input, _VIDEO_EXTENSIONS))
+        if not files:
+            print(f"No video files found in '{args.input}'")
+            sys.exit(1)
+        os.makedirs(args.output, exist_ok=True)
+        print(f"Batch roundtrip: {len(files)} file(s) -> '{args.output}' ({workers} workers)")
+        for path in files:
+            # Preserve original container extension (e.g. .mkv -> .mkv)
+            out_path = _batch_output_path(args.output, path)
+            _roundtrip_one(path, out_path, args, workers)
+    else:
+        _roundtrip_one(args.input, args.output, args, workers)
 
 
 def _roundtrip_progressive(cap, out, width, height, total_frames, workers,
@@ -520,20 +603,20 @@ def _roundtrip_telecine(cap, out, width, height, total_frames, workers,
     print(f"Done: {film_idx} film frames -> {ntsc_num} NTSC frames")
 
 
-def cmd_image(args):
+def _image_one(input_path, output_path, args):
     """Roundtrip a single image through the NTSC composite pipeline."""
     import cv2
     from ntsc_simulator.encoder import encode_frame
     from ntsc_simulator.decoder import decode_frame
     from ntsc_simulator.signal_io import export_signal, export_wav
 
-    frame_bgr = cv2.imread(args.input)
+    frame_bgr = cv2.imread(input_path)
     if frame_bgr is None:
-        print(f"Error: Cannot open image '{args.input}'")
-        sys.exit(1)
+        print(f"Warning: Cannot open image '{input_path}', skipping.")
+        return
 
     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    print(f"Input: {args.input} ({frame_rgb.shape[1]}x{frame_rgb.shape[0]})")
+    print(f"Input: {input_path} ({frame_rgb.shape[1]}x{frame_rgb.shape[0]})")
 
     print("Encoding to composite signal...")
     signal = encode_frame(frame_rgb, frame_number=0)
@@ -559,8 +642,25 @@ def cmd_image(args):
                               comb_1h=comb_1h)
 
     result_bgr = cv2.cvtColor(result_rgb, cv2.COLOR_RGB2BGR)
-    cv2.imwrite(args.output, result_bgr)
-    print(f"Output: {args.output} ({width}x{height})")
+    cv2.imwrite(output_path, result_bgr)
+    print(f"Output: {output_path} ({width}x{height})")
+
+
+def cmd_image(args):
+    """Roundtrip a single image (or folder of images) through the NTSC composite pipeline."""
+    if os.path.isdir(args.input):
+        files = list(_iter_files(args.input, _IMAGE_EXTENSIONS))
+        if not files:
+            print(f"No image files found in '{args.input}'")
+            sys.exit(1)
+        os.makedirs(args.output, exist_ok=True)
+        print(f"Batch image: {len(files)} file(s) -> '{args.output}'")
+        for path in files:
+            # Preserve original image format extension
+            out_path = _batch_output_path(args.output, path)
+            _image_one(path, out_path, args)
+    else:
+        _image_one(args.input, args.output, args)
 
 
 def cmd_colorbars(args):
@@ -611,10 +711,15 @@ def main():
         epilog="""\
 Examples:
   python main.py encode input.mp4 -o signal.npy
+  python main.py encode videos/ -o signals/           # batch: folder -> folder of .npy
   python main.py decode signal.npy -o output.mp4
+  python main.py decode signals/ -o decoded/          # batch: folder of .npy -> folder
+  python main.py decode signals/ -o decoded/ --ext .mkv
   python main.py roundtrip input.mp4 -o output.mp4
+  python main.py roundtrip videos/ -o out/            # batch: preserves container (e.g. .mkv -> .mkv)
   python main.py roundtrip input.mp4 -o output.mp4 --telecine
   python main.py image photo.png -o ntsc_photo.png
+  python main.py image photos/ -o out/                # batch: preserves image format
   python main.py colorbars -o colorbars.npy
         """)
 
@@ -634,6 +739,8 @@ Examples:
     p_dec.add_argument('--height', type=int, default=480, help='Output height')
     p_dec.add_argument('--comb-1h', action='store_true',
                        help='Use 1H line-delay comb filter (reduces rainbow, adds hanging dots)')
+    p_dec.add_argument('--ext', default='.mp4',
+                       help='Output container extension for batch mode (default: .mp4, e.g. .mkv)')
     p_dec.add_argument('--crf', type=int, default=17, help='x264 CRF quality (0=lossless, 51=worst, default: 17)')
     p_dec.add_argument('--preset', default='fast',
                        help='x264 preset (ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow, default: fast)')
